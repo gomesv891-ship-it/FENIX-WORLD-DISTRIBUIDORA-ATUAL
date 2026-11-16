@@ -54,8 +54,9 @@ import { AudioSnippetEditor } from './AudioSnippetEditor';
 import { saveWholeCollectionToSupabase } from '../utils/supabaseClient';
 import {
   adminUpdateUserAccount,
-  adminResetUserPassword,
-  updateUserPasswordDirectly,
+  adminResetUserPasswordAsync,
+  updateUserPasswordDirectlyAsync,
+  validateLoginAttemptAsync,
   adminCreateOrUpdateUserAccount,
   adminDeleteUserAccount,
   adminDeleteUserAccountAsync,
@@ -635,7 +636,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
   };
 
   // Confirmar e aplicar a redefinição de senha do funcionário
-  const handleConfirmResetPassword = () => {
+  const handleConfirmResetPassword = async () => {
     if (!isDirector) {
       showToast('Apenas o Diretor Éder Perez possui permissão para redefinir senhas de usuários.');
       return;
@@ -651,11 +652,15 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
 
     const canonicalName = normalizeAuthorizedName(targetUser.nome);
     if (canonicalName) {
-      adminResetUserPassword(
+      const res = await adminResetUserPasswordAsync(
         canonicalName,
         pass,
         resetPasswordModal.requireChangeOnNextLogin
       );
+      if (!res.success) {
+        showToast(res.error || 'Erro ao salvar nova senha no banco de dados.');
+        return;
+      }
     }
 
     try {
@@ -1279,7 +1284,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
     text: string;
   } | null>(null);
 
-  const handleUpdatePassword = (e: React.FormEvent) => {
+  const handleUpdatePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setPasswordMessage(null);
 
@@ -1307,15 +1312,30 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
     }
 
     const canonical = normalizeAuthorizedName(currentUserName);
-    if (canonical) {
-      const res = updateUserPasswordDirectly(canonical, passwordData.novaSenha);
-      if (!res.success) {
-        setPasswordMessage({
-          type: 'error',
-          text: res.error || 'Erro ao atualizar senha no banco de dados.',
-        });
-        return;
-      }
+    if (!canonical) {
+      setPasswordMessage({
+        type: 'error',
+        text: 'Usuário atual não identificado.',
+      });
+      return;
+    }
+
+    const check = await validateLoginAttemptAsync(canonical, passwordData.senhaAtual);
+    if (!check.success) {
+      setPasswordMessage({
+        type: 'error',
+        text: 'A senha atual informada está incorreta.',
+      });
+      return;
+    }
+
+    const res = await updateUserPasswordDirectlyAsync(canonical, passwordData.novaSenha);
+    if (!res.success) {
+      setPasswordMessage({
+        type: 'error',
+        text: res.error || 'Erro ao atualizar senha no banco de dados.',
+      });
+      return;
     }
 
     setPasswordMessage({

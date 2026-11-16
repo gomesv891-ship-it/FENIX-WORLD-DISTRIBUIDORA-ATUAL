@@ -1,4 +1,9 @@
-import { getSupabaseClient, withTimeout } from './supabaseClient';
+import {
+  getSupabaseClient,
+  withTimeout,
+  getLocalRawSafe,
+  setLocalCollectionSafe,
+} from './supabaseClient';
 
 export type AuthorizedUserName = string;
 
@@ -114,7 +119,7 @@ const INITIAL_ACCOUNTS: Record<string, UserAccount> = {
 export function getStoredAccounts(): Record<string, UserAccount> {
   if (typeof window === 'undefined') return INITIAL_ACCOUNTS;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = getLocalRawSafe(STORAGE_KEY);
     let accounts: Record<string, UserAccount> = {};
     if (raw) {
       try {
@@ -140,7 +145,7 @@ export function getStoredAccounts(): Record<string, UserAccount> {
     // Sincronizar com fenix_usuarios_v2 (painel de Gestão de Usuários)
     // GARANTIA: Gestão de Usuários e Login compartilham rigorosamente a MESMA fonte da verdade
     try {
-      const fenixUsersRaw = localStorage.getItem(FENIX_USUARIOS_KEY);
+      const fenixUsersRaw = getLocalRawSafe(FENIX_USUARIOS_KEY);
       if (fenixUsersRaw) {
         const fenixUsers = JSON.parse(fenixUsersRaw);
         if (Array.isArray(fenixUsers)) {
@@ -247,7 +252,7 @@ export function getStoredAccounts(): Record<string, UserAccount> {
       } catch {}
     }
 
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(accounts));
+    setLocalCollectionSafe(STORAGE_KEY, accounts);
     return accounts;
   } catch {
     return { ...INITIAL_ACCOUNTS };
@@ -455,13 +460,24 @@ export async function fetchAccountsFromSupabase(): Promise<Record<string, UserAc
       .eq('key', STORAGE_KEY)
       .maybeSingle();
 
-    const rowRes = await withTimeout(fetchPromise, 2200, null);
+    const rowRes = await withTimeout(fetchPromise, 12000, null);
 
-    if (rowRes && !rowRes.error && rowRes.data && rowRes.data.data && typeof rowRes.data.data === 'object' && Object.keys(rowRes.data.data).length > 0) {
-      const remoteAccounts = rowRes.data.data as Record<string, UserAccount>;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(remoteAccounts));
-      window.dispatchEvent(new Event('fenix_auth_updated'));
-      return remoteAccounts;
+    if (rowRes && !rowRes.error && rowRes.data && rowRes.data.data) {
+      let parsedRemote = rowRes.data.data;
+      if (typeof parsedRemote === 'string') {
+        try {
+          parsedRemote = JSON.parse(parsedRemote);
+        } catch {
+          parsedRemote = null;
+        }
+      }
+      if (parsedRemote && typeof parsedRemote === 'object' && Object.keys(parsedRemote).length > 0) {
+        const remoteAccounts = parsedRemote as Record<string, UserAccount>;
+        setLocalCollectionSafe(STORAGE_KEY, remoteAccounts);
+        const normalized = getStoredAccounts();
+        window.dispatchEvent(new Event('fenix_auth_updated'));
+        return normalized;
+      }
     }
   } catch (err) {
     console.warn('Erro não-bloqueante ao carregar contas do Supabase:', err);
@@ -539,14 +555,14 @@ export async function saveStoredAccountsToSupabase(
           { onConflict: 'key' }
         );
 
-      localStorage.setItem(FENIX_USUARIOS_KEY, JSON.stringify(fenixUsersList));
+      setLocalCollectionSafe(FENIX_USUARIOS_KEY, fenixUsersList);
       window.dispatchEvent(new Event('fenix_users_updated'));
     } catch (uErr) {
       console.warn('Erro ao sincronizar fenix_usuarios_v2:', uErr);
     }
 
-    // Supabase confirmed success -> update local cache
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(accounts));
+    // Supabase confirmed success -> update local cache safely
+    setLocalCollectionSafe(STORAGE_KEY, accounts);
     window.dispatchEvent(new Event('fenix_auth_updated'));
     window.dispatchEvent(new Event('storage'));
 
@@ -560,7 +576,7 @@ export async function saveStoredAccountsToSupabase(
 export function saveStoredAccounts(accounts: Record<string, UserAccount>): void {
   if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(accounts));
+    setLocalCollectionSafe(STORAGE_KEY, accounts);
     // Persiste imediatamente no Supabase em segundo plano
     saveStoredAccountsToSupabase(accounts).catch((err) => {
       console.error('Erro ao persistir contas no Supabase:', err);
@@ -726,8 +742,8 @@ export async function validateLoginAttemptAsync(
     };
   }
 
-  // Busca contas com timeout seguro de 2.2s e fallback imediato para as contas locais (nunca bloqueia ou trava o login)
-  const accounts = await withTimeout(fetchAccountsFromSupabase(), 2200, getStoredAccounts());
+  // Busca contas atualizadas no Supabase com timeout seguro de 12.5s e fallback para contas locais
+  const accounts = await withTimeout(fetchAccountsFromSupabase(), 12500, getStoredAccounts());
 
   // Exact registered name required
   const canonicalName = normalizeAuthorizedName(nameInput);

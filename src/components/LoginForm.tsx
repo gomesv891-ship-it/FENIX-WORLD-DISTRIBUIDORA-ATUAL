@@ -9,6 +9,7 @@ import {
   completeFirstLoginPasswordChangeAsync,
   setCurrentAuthSession,
   getActiveAuthorizedUsers,
+  fetchAccountsFromSupabase,
   AuthorizedUserName,
   UserAccount,
 } from '../utils/auth';
@@ -40,6 +41,11 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onOpenForgotPassword, onLo
       setActiveUsers(getActiveAuthorizedUsers());
     };
     refreshUsers();
+    fetchAccountsFromSupabase()
+      .then(() => {
+        refreshUsers();
+      })
+      .catch(() => {});
     window.addEventListener('fenix_auth_updated', refreshUsers);
     window.addEventListener('storage', refreshUsers);
     return () => {
