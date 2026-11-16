@@ -1,5 +1,10 @@
 import { getStoredAccounts, getCurrentAuthUser } from './auth';
-import { saveWholeCollectionToSupabase } from './supabaseClient';
+import {
+  saveWholeCollectionToSupabase,
+  saveItemToSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+} from './supabaseClient';
 import {
   getUserNotificationPreferences,
   playUserCustomSoundForCategory,
@@ -143,24 +148,22 @@ export function getAllStoredNotifications(): SystemNotification[] {
 export function deactivateFollowUpFromNotification(followUpId: string): boolean {
   if (!followUpId) return false;
   try {
-    const raw = localStorage.getItem('fenix_followup_cards_v2') || localStorage.getItem('fenix_followup_db');
-    if (raw) {
-      const items = JSON.parse(raw);
-      if (Array.isArray(items)) {
-        let changed = false;
-        const updated = items.map((it: any) => {
-          if (it.id === followUpId) {
-            changed = true;
-            return { ...it, lembretesAtivos: false };
-          }
-          return it;
-        });
-        if (changed) {
-          localStorage.setItem('fenix_followup_cards_v2', JSON.stringify(updated));
-          saveWholeCollectionToSupabase('fenix_followup_cards_v2', updated).catch(() => {});
-          window.dispatchEvent(new Event('fenix_followup_updated'));
-          return true;
+    const fupV2 = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+    const items = fupV2.length > 0 ? fupV2 : getLocalCollectionSafe<any>('fenix_followup_db', []);
+    if (Array.isArray(items) && items.length > 0) {
+      let updatedItem: any = null;
+      const updated = items.map((it: any) => {
+        if (it && it.id === followUpId) {
+          updatedItem = { ...it, lembretesAtivos: false };
+          return updatedItem;
         }
+        return it;
+      });
+      if (updatedItem) {
+        setLocalCollectionSafe('fenix_followup_cards_v2', updated);
+        saveItemToSupabase('fenix_followup_cards_v2', updatedItem, 'id').catch(() => {});
+        window.dispatchEvent(new Event('fenix_followup_updated'));
+        return true;
       }
     }
   } catch (err) {

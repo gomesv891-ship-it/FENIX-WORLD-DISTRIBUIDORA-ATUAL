@@ -1,5 +1,12 @@
 import { FollowUpItem, FollowUpStatus, VendaGerencial } from '../types';
-import { getSupabaseClient, saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase } from './supabaseClient';
+import {
+  getSupabaseClient,
+  saveItemToSupabase,
+  deleteItemFromSupabase,
+  saveWholeCollectionToSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+} from './supabaseClient';
 import { calcularCustosVariaveis, calcularLucroEMargem } from './custosVariaveis';
 import { findMatchingVendaIndex, deduplicateVendasList, syncSingleMetaSaleToVendas, DELETED_VENDAS_KEY } from './vendasService';
 import { getUserIdByName, isUserRevoked } from './auth';
@@ -96,14 +103,12 @@ function findOriginOrcamento(budget: FollowUpItem): any | null {
     const bareOrcId = originOrcId.replace(/^orc_/, '');
 
     const sources = [
-      localStorage.getItem('fenix_orcamentos_history'),
-      localStorage.getItem('fenix_saved_orcamentos'),
+      getLocalCollectionSafe<any>('fenix_orcamentos_history', []),
+      getLocalCollectionSafe<any>('fenix_saved_orcamentos', []),
     ];
 
-    for (const raw of sources) {
-      if (!raw) continue;
-      const list = JSON.parse(raw);
-      if (!Array.isArray(list)) continue;
+    for (const list of sources) {
+      if (!Array.isArray(list) || list.length === 0) continue;
       const found = list.find((o: any) => {
         if (!o || !o.id) return false;
         const oId = String(o.id).trim();
@@ -124,9 +129,7 @@ function findOriginOrcamento(budget: FollowUpItem): any | null {
  */
 function clearDeletedIdsForConfirmedSale(idsToRestore: string[], user: string): void {
   try {
-    const rawDel = localStorage.getItem(DELETED_VENDAS_KEY);
-    if (!rawDel) return;
-    const parsedDel = JSON.parse(rawDel);
+    const parsedDel = getLocalCollectionSafe<any>(DELETED_VENDAS_KEY, []);
     if (!Array.isArray(parsedDel) || parsedDel.length === 0) return;
 
     const restoreSet = new Set(idsToRestore.filter(Boolean).map((x) => String(x).trim()));
@@ -135,7 +138,7 @@ function clearDeletedIdsForConfirmedSale(idsToRestore: string[], user: string): 
     const filteredDel = parsedDel.filter((d: any) => !restoreSet.has(String(d).trim()));
     if (filteredDel.length === parsedDel.length) return;
 
-    localStorage.setItem(DELETED_VENDAS_KEY, JSON.stringify(filteredDel));
+    setLocalCollectionSafe(DELETED_VENDAS_KEY, filteredDel);
     if (filteredDel.length > 0) {
       saveWholeCollectionToSupabase(DELETED_VENDAS_KEY, filteredDel, user).catch(() => {});
     } else {
@@ -285,8 +288,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
 
     // 1.1 Atualizar META DA CONSULTORA RESPONSÁVEL
     try {
-      const rawMetas = localStorage.getItem(METAS_SALES_STORAGE_KEY);
-      let metasSales: any[] = rawMetas ? JSON.parse(rawMetas) : [];
+      let metasSales: any[] = getLocalCollectionSafe<any>(METAS_SALES_STORAGE_KEY, []);
       if (!Array.isArray(metasSales)) metasSales = [];
 
       const clientNameNorm = clientName.toLowerCase().trim();
@@ -386,7 +388,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
       const withoutDuplicates = metasSales.filter((s) => !isMatchingMetaSale(s));
       const updatedMetas = [metaSaleRecord, ...withoutDuplicates];
 
-      localStorage.setItem(METAS_SALES_STORAGE_KEY, JSON.stringify(updatedMetas));
+      setLocalCollectionSafe(METAS_SALES_STORAGE_KEY, updatedMetas);
       // Salva de forma atômica no Supabase garantindo deduplicação
       saveItemToSupabase(METAS_SALES_STORAGE_KEY, metaSaleRecord, 'id', responsibleUser).catch(() => {});
       syncSingleMetaSaleToVendas(metaSaleRecord, responsibleUser).catch(() => {});
@@ -397,8 +399,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
 
     // 1.2 Atualizar registro gerencial (mantido internamente em sync sem impactar layout)
     try {
-      const rawVendas = localStorage.getItem(VENDAS_GERENCIAL_STORAGE_KEY);
-      let gerencialSales: VendaGerencial[] = rawVendas ? JSON.parse(rawVendas) : [];
+      let gerencialSales: VendaGerencial[] = getLocalCollectionSafe<VendaGerencial>(VENDAS_GERENCIAL_STORAGE_KEY, []);
       if (!Array.isArray(gerencialSales)) gerencialSales = [];
 
       const custoProdutos = Number((saleValue * 0.6).toFixed(2));
@@ -461,7 +462,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
       }
       updatedVendas = deduplicateVendasList(updatedVendas);
 
-      localStorage.setItem(VENDAS_GERENCIAL_STORAGE_KEY, JSON.stringify(updatedVendas));
+      setLocalCollectionSafe(VENDAS_GERENCIAL_STORAGE_KEY, updatedVendas);
       saveWholeCollectionToSupabase(VENDAS_GERENCIAL_STORAGE_KEY, updatedVendas, currentUserName).catch(() => {});
       window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
       window.dispatchEvent(new Event('fenix_vendas_updated'));
@@ -474,10 +475,9 @@ export function syncFollowUpStatusWithMetasAndVendas(
 
     // 2.2 Remover das VENDAS DO DIRETOR ÉDER se mudou de Vendido para outro status
     try {
-      const rawVendas = localStorage.getItem(VENDAS_GERENCIAL_STORAGE_KEY);
-      if (rawVendas) {
-        const gerencialSales: VendaGerencial[] = JSON.parse(rawVendas);
-        if (Array.isArray(gerencialSales)) {
+      const gerencialSales: VendaGerencial[] = getLocalCollectionSafe<VendaGerencial>(VENDAS_GERENCIAL_STORAGE_KEY, []);
+      if (Array.isArray(gerencialSales) && gerencialSales.length > 0) {
+        {
           const removedVenda = gerencialSales.find(
             (v) =>
               v.orcamentoId === budget.id ||
@@ -495,7 +495,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
               !(cleanPedido && v.numeroPedido === cleanPedido && v.cliente?.trim().toLowerCase() === clientName.toLowerCase())
           );
           if (filtered.length !== gerencialSales.length) {
-            localStorage.setItem(VENDAS_GERENCIAL_STORAGE_KEY, JSON.stringify(filtered));
+            setLocalCollectionSafe(VENDAS_GERENCIAL_STORAGE_KEY, filtered);
             if (removedVenda?.id) {
               deleteItemFromSupabase(VENDAS_GERENCIAL_STORAGE_KEY, removedVenda.id, 'id', currentUserName).catch(() => {});
             }
@@ -545,9 +545,7 @@ export function onMetaSaleDeleted(
   // 1. ATUALIZAR FOLLOW-UP PARA 'PERDIDO'
   const updateFollowUpToPerdido = (key: string): boolean => {
     try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return false;
-      const list: FollowUpItem[] = JSON.parse(raw);
+      const list: FollowUpItem[] = getLocalCollectionSafe<FollowUpItem>(key, []);
       if (!Array.isArray(list) || list.length === 0) return false;
 
       let changed = false;
@@ -594,7 +592,7 @@ export function onMetaSaleDeleted(
       });
 
       if (changed) {
-        localStorage.setItem(key, JSON.stringify(updatedList));
+        setLocalCollectionSafe(key, updatedList);
         const targetPerdidoItem = updatedList.find(it => it.id === targetId || (targetPedido && extractCleanPedido(it.pedido) === targetPedido));
         if (targetPerdidoItem) {
           saveItemToSupabase(key, targetPerdidoItem, 'id', currentUserName).catch(() => {});
@@ -616,10 +614,9 @@ export function onMetaSaleDeleted(
 
   // 2. REMOVER DAS VENDAS DO DIRETOR ÉDER
   try {
-    const rawVendas = localStorage.getItem(VENDAS_GERENCIAL_STORAGE_KEY);
-    if (rawVendas) {
-      const gerencialSales: VendaGerencial[] = JSON.parse(rawVendas);
-      if (Array.isArray(gerencialSales)) {
+    const gerencialSales: VendaGerencial[] = getLocalCollectionSafe<VendaGerencial>(VENDAS_GERENCIAL_STORAGE_KEY, []);
+    if (Array.isArray(gerencialSales) && gerencialSales.length > 0) {
+      {
         const filtered = gerencialSales.filter((v) => {
           const vCleanPed = extractCleanPedido(v.numeroPedido);
           const vClient = (v.cliente || '').trim().toLowerCase();
@@ -635,7 +632,7 @@ export function onMetaSaleDeleted(
         });
 
         if (filtered.length !== gerencialSales.length) {
-          localStorage.setItem(VENDAS_GERENCIAL_STORAGE_KEY, JSON.stringify(filtered));
+          setLocalCollectionSafe(VENDAS_GERENCIAL_STORAGE_KEY, filtered);
           const removedItem = gerencialSales.find(v => {
             const vCleanPed = extractCleanPedido(v.numeroPedido);
             const vClient = (v.cliente || '').trim().toLowerCase();

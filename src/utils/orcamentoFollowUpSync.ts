@@ -1,5 +1,12 @@
 import { FollowUpItem, FollowUpStatus, FollowUpHistoryEntry, SavedOrcamento, ClientRecord } from '../types';
-import { saveItemToSupabase, saveWholeCollectionToSupabase, getSupabaseClient } from './supabaseClient';
+import {
+  saveItemToSupabase,
+  saveWholeCollectionToSupabase,
+  getSupabaseClient,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
+} from './supabaseClient';
 import { getUserIdByName } from './auth';
 import { getSellerIdForUser } from './userDataFilter';
 
@@ -203,14 +210,9 @@ export function resolveClientPhone(
 
   if (directPhone) return directPhone;
 
-  // Busca na base de clientes locais se tiver clientId ou nome
+  // Busca na base de clientes locais/cache se tiver clientId ou nome
   if (!clientsList || clientsList.length === 0) {
-    try {
-      const rawClients = localStorage.getItem(CLIENTS_STORAGE_KEY);
-      if (rawClients) {
-        clientsList = JSON.parse(rawClients);
-      }
-    } catch {}
+    clientsList = getLocalCollectionSafe<ClientRecord>(CLIENTS_STORAGE_KEY, []);
   }
 
   if (Array.isArray(clientsList) && clientsList.length > 0) {
@@ -317,10 +319,8 @@ export function generateNextPedidoNumber(): string {
   let maxNum = 1000;
   const inspectList = (key: string, fields: string[]) => {
     try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return;
-      const list = JSON.parse(raw);
-      if (!Array.isArray(list)) return;
+      const list = getLocalCollectionSafe<any>(key, []);
+      if (!Array.isArray(list) || list.length === 0) return;
       list.forEach((item: any) => {
         if (!item) return;
         fields.forEach((f) => {
@@ -473,36 +473,16 @@ export async function syncSingleOrcamentoToFollowUp(
   const timeFormatted = `${hora}:${min}`;
 
   const orcId = String(orcamento.id).trim();
-  let followUpList: FollowUpItem[] = [];
-
-  try {
-    const rawFollowUp = localStorage.getItem(FOLLOWUP_STORAGE_KEY);
-    if (rawFollowUp) {
-      const parsed = JSON.parse(rawFollowUp);
-      if (Array.isArray(parsed)) followUpList = parsed;
-    }
-  } catch {}
+  let followUpList: FollowUpItem[] = getLocalCollectionSafe<FollowUpItem>(FOLLOWUP_STORAGE_KEY, []);
 
   // Consulta o Supabase para garantir sincronia entre computador e celular sem criar duplicidades
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      const { data: remoteRow, error } = await supabase
-        .from('fenix_kv_store')
-        .select('data')
-        .eq('key', FOLLOWUP_STORAGE_KEY)
-        .maybeSingle();
-
-      if (!error && remoteRow && remoteRow.data !== undefined) {
-        let remoteData = remoteRow.data;
-        if (typeof remoteData === 'string') {
-          try {
-            remoteData = JSON.parse(remoteData);
-          } catch {}
-        }
-        if (Array.isArray(remoteData) && remoteData.length > 0) {
-          followUpList = deduplicateFollowUpList([...remoteData, ...followUpList]);
-        }
+      const { rows } = await fetchSupabaseKeysIndividually([FOLLOWUP_STORAGE_KEY], 12000);
+      const remoteData = rows.get(FOLLOWUP_STORAGE_KEY);
+      if (Array.isArray(remoteData) && remoteData.length > 0) {
+        followUpList = deduplicateFollowUpList([...remoteData, ...followUpList]);
       }
     } catch (err) {
       console.warn('Aviso ao consultar Follow-up remoto antes do sync 1:1:', err);
@@ -664,10 +644,8 @@ export async function syncSingleOrcamentoToFollowUp(
   // Deduplicação estrita 1:1
   const dedupedList = deduplicateFollowUpList(followUpList);
 
-  // Salva no localStorage e emite evento
-  try {
-    localStorage.setItem(FOLLOWUP_STORAGE_KEY, JSON.stringify(dedupedList));
-  } catch {}
+  // Salva no cache seguro/localStorage e emite evento
+  setLocalCollectionSafe(FOLLOWUP_STORAGE_KEY, dedupedList);
   window.dispatchEvent(new Event('fenix_followup_updated'));
 
   // Salva de forma persistente no Supabase
@@ -710,57 +688,45 @@ export async function syncAllSavedOrcamentosToFollowUp(options?: {
     }
   };
 
-  try {
-    const rawHist = localStorage.getItem(ORCAMENTOS_HISTORY_KEY);
-    if (rawHist) {
-      const parsed = JSON.parse(rawHist);
-      if (Array.isArray(parsed)) parsed.forEach(mergeOrcIntoMap);
-    }
-  } catch {}
+  getLocalCollectionSafe<SavedOrcamento>(ORCAMENTOS_HISTORY_KEY, []).forEach(mergeOrcIntoMap);
+  getLocalCollectionSafe<SavedOrcamento>(ORCAMENTOS_SAVED_KEY, []).forEach(mergeOrcIntoMap);
 
-  try {
-    const rawSaved = localStorage.getItem(ORCAMENTOS_SAVED_KEY);
-    if (rawSaved) {
-      const parsed = JSON.parse(rawSaved);
-      if (Array.isArray(parsed)) parsed.forEach(mergeOrcIntoMap);
-    }
-  } catch {}
+  // Carrega lista local/cache de follow-up e clientes
+  let currentFollowUpList: FollowUpItem[] = getLocalCollectionSafe<FollowUpItem>(FOLLOWUP_STORAGE_KEY, []);
+  let clientsList: ClientRecord[] = getLocalCollectionSafe<ClientRecord>(CLIENTS_STORAGE_KEY, []);
 
-  // Carrega lista local de follow-up
-  let currentFollowUpList: FollowUpItem[] = [];
-  try {
-    const rawFup = localStorage.getItem(FOLLOWUP_STORAGE_KEY);
-    if (rawFup) {
-      const parsed = JSON.parse(rawFup);
-      if (Array.isArray(parsed)) currentFollowUpList = parsed;
-    }
-  } catch {}
-
-  // 2. Consulta também o Supabase para orçamentos e follow-ups remotos
+  // 2. Consulta também o Supabase de forma isolada por chave pesada (evita timeouts)
+  let remoteFupSucceeded = false;
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      const { data: rows, error } = await supabase
-        .from('fenix_kv_store')
-        .select('key, data')
-        .in('key', [ORCAMENTOS_HISTORY_KEY, ORCAMENTOS_SAVED_KEY, FOLLOWUP_STORAGE_KEY]);
+      const { rows, succeededKeys } = await fetchSupabaseKeysIndividually(
+        [ORCAMENTOS_HISTORY_KEY, ORCAMENTOS_SAVED_KEY, FOLLOWUP_STORAGE_KEY, CLIENTS_STORAGE_KEY],
+        15000
+      );
+      remoteFupSucceeded = succeededKeys.has(FOLLOWUP_STORAGE_KEY);
 
-      if (!error && Array.isArray(rows)) {
-        rows.forEach((r) => {
-          let list = r.data;
-          if (typeof list === 'string') {
-            try {
-              list = JSON.parse(list);
-            } catch {}
-          }
-          if (!Array.isArray(list)) return;
+      const remoteHist = rows.get(ORCAMENTOS_HISTORY_KEY);
+      if (Array.isArray(remoteHist)) {
+        remoteHist.forEach(mergeOrcIntoMap);
+        setLocalCollectionSafe(ORCAMENTOS_HISTORY_KEY, remoteHist);
+      }
 
-          if (r.key === FOLLOWUP_STORAGE_KEY) {
-            currentFollowUpList = deduplicateFollowUpList([...list, ...currentFollowUpList]);
-          } else {
-            list.forEach(mergeOrcIntoMap);
-          }
-        });
+      const remoteSaved = rows.get(ORCAMENTOS_SAVED_KEY);
+      if (Array.isArray(remoteSaved)) {
+        remoteSaved.forEach(mergeOrcIntoMap);
+        setLocalCollectionSafe(ORCAMENTOS_SAVED_KEY, remoteSaved);
+      }
+
+      const remoteFup = rows.get(FOLLOWUP_STORAGE_KEY);
+      if (Array.isArray(remoteFup)) {
+        currentFollowUpList = deduplicateFollowUpList([...remoteFup, ...currentFollowUpList]);
+      }
+
+      const remoteClients = rows.get(CLIENTS_STORAGE_KEY);
+      if (Array.isArray(remoteClients) && remoteClients.length > 0) {
+        clientsList = remoteClients;
+        setLocalCollectionSafe(CLIENTS_STORAGE_KEY, remoteClients);
       }
     } catch (err) {
       console.warn('Erro ao carregar dados remotos para sync Follow-up:', err);
@@ -771,16 +737,6 @@ export async function syncAllSavedOrcamentosToFollowUp(options?: {
   if (allOrcamentos.length === 0) {
     return { syncedCount: 0, totalCount: 0 };
   }
-
-  // Carrega clientes para resolução de telefone
-  let clientsList: ClientRecord[] = [];
-  try {
-    const rawClients = localStorage.getItem(CLIENTS_STORAGE_KEY);
-    if (rawClients) {
-      const parsed = JSON.parse(rawClients);
-      if (Array.isArray(parsed)) clientsList = parsed;
-    }
-  } catch {}
 
   let createdOrUpdatedCount = 0;
   const updatedFollowUpList = deduplicateFollowUpList([...currentFollowUpList]);
@@ -940,13 +896,13 @@ export async function syncAllSavedOrcamentosToFollowUp(options?: {
   const finalDeduped = deduplicateFollowUpList(updatedFollowUpList);
 
   if (createdOrUpdatedCount > 0 || finalDeduped.length !== currentFollowUpList.length) {
-    try {
-      localStorage.setItem(FOLLOWUP_STORAGE_KEY, JSON.stringify(finalDeduped));
-    } catch {}
+    setLocalCollectionSafe(FOLLOWUP_STORAGE_KEY, finalDeduped);
     window.dispatchEvent(new Event('fenix_followup_updated'));
 
-    // Persiste no Supabase
-    saveWholeCollectionToSupabase(FOLLOWUP_STORAGE_KEY, finalDeduped, currentUserName).catch(() => {});
+    // Persiste no Supabase somente se a consulta remota foi concluída com sucesso (evita sobrescrita parcial)
+    if (remoteFupSucceeded && finalDeduped.length > 0) {
+      saveWholeCollectionToSupabase(FOLLOWUP_STORAGE_KEY, finalDeduped, currentUserName).catch(() => {});
+    }
   }
 
   return { syncedCount: createdOrUpdatedCount, totalCount: allOrcamentos.length };

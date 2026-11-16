@@ -76,6 +76,7 @@ import {
 import { UserAvatar } from './UserAvatar';
 import { ProfileModal } from './ProfileModal';
 import { getDailyBibleVerse, BibleVerse } from '../data/dailyBibleVerses';
+import { getLocalCollectionSafe } from '../utils/supabaseClient';
 
 interface HeaderProps {
   onOpenMobileMenu: () => void;
@@ -343,30 +344,32 @@ export const Header: React.FC<HeaderProps> = ({
     };
   }, [searchQuery]);
 
-  // Carregar dados reais do CRM
+  // Carregar dados reais do CRM (usando cache em memória seguro + localStorage)
   useEffect(() => {
     const loadSystemData = () => {
       try {
-        const storedClients = localStorage.getItem('fenix_clients_db');
-        if (storedClients) setClientsDb(JSON.parse(storedClients));
+        setClientsDb(getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []));
 
-        const storedFup = localStorage.getItem('fenix_followup_db');
-        if (storedFup) setFollowUpDb(JSON.parse(storedFup));
+        const fupV2 = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+        const fupList = fupV2.length > 0 ? fupV2 : getLocalCollectionSafe<any>('fenix_followup_db', []);
+        setFollowUpDb(fupList);
 
-        const storedOrc = localStorage.getItem('fenix_saved_orcamentos') || localStorage.getItem('fenix_orcamentos_history');
-        if (storedOrc) setOrcamentosDb(JSON.parse(storedOrc));
+        const orcMap = new Map<string, any>();
+        getLocalCollectionSafe<any>('fenix_saved_orcamentos', []).forEach((o) => {
+          if (o && o.id) orcMap.set(o.id, o);
+        });
+        getLocalCollectionSafe<any>('fenix_orcamentos_history', []).forEach((o) => {
+          if (o && o.id) orcMap.set(o.id, o);
+        });
+        setOrcamentosDb(Array.from(orcMap.values()));
 
-        const storedTar = localStorage.getItem('fenix_tarefas_db');
-        if (storedTar) setTarefasDb(JSON.parse(storedTar));
+        setTarefasDb(getLocalCollectionSafe<any>('fenix_tarefas_db', []));
+        setBoletosDb(getLocalCollectionSafe<any>('fenix_boletos_db', []));
 
-        const storedBol = localStorage.getItem('fenix_boletos_db');
-        if (storedBol) setBoletosDb(JSON.parse(storedBol));
+        const notesMain = getLocalCollectionSafe<any>('fenix_notes_db', []);
+        setNotasDb(notesMain.length > 0 ? notesMain : getLocalCollectionSafe<any>('fenix_notes_v1', []));
 
-        const storedNot = localStorage.getItem('fenix_notes_db') || localStorage.getItem('fenix_notes_v1');
-        if (storedNot) setNotasDb(JSON.parse(storedNot));
-
-        const storedPen = localStorage.getItem('fenix_pendencias_v1');
-        if (storedPen) setPendenciasDb(JSON.parse(storedPen));
+        setPendenciasDb(getLocalCollectionSafe<any>('fenix_pendencias_v1', []));
       } catch (e) {
         console.error('Erro ao indexar dados do CRM:', e);
       }
@@ -375,10 +378,14 @@ export const Header: React.FC<HeaderProps> = ({
     loadSystemData();
     window.addEventListener('storage', loadSystemData);
     window.addEventListener('fenix_clients_updated', loadSystemData);
+    window.addEventListener('fenix_orcamentos_updated', loadSystemData);
+    window.addEventListener('fenix_followup_updated', loadSystemData);
     window.addEventListener('fenix_metas_updated', loadSystemData);
     return () => {
       window.removeEventListener('storage', loadSystemData);
       window.removeEventListener('fenix_clients_updated', loadSystemData);
+      window.removeEventListener('fenix_orcamentos_updated', loadSystemData);
+      window.removeEventListener('fenix_followup_updated', loadSystemData);
       window.removeEventListener('fenix_metas_updated', loadSystemData);
     };
   }, []);

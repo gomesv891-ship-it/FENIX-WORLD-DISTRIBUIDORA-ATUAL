@@ -63,7 +63,14 @@ import {
 } from '../utils/configOrcamentoEMetas';
 import { addOrUpdateSaleInPosVendas } from '../utils/syncPosVendas';
 import { isRecordOfResponsible, isBudgetProposalOfSeller, resolveCanonicalProposalSeller, getSellerIdForUser } from '../utils/userDataFilter';
-import { getSupabaseClient, saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase, pullDataFromSupabase } from '../utils/supabaseClient';
+import {
+  getSupabaseClient,
+  saveItemToSupabase,
+  deleteItemFromSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
+} from '../utils/supabaseClient';
 import { ResponsibleFilterTabs } from './ResponsibleFilterTabs';
 import { MetasMarketplaceJeferson } from './metas/MetasMarketplaceJeferson';
 import { SimuladorFechamento } from './metas/SimuladorFechamento';
@@ -489,9 +496,7 @@ export function loadAllPipelineBudgets(): PipelineBudgetItem[] {
   const orcByBareId = new Map<string, any>();
   ['fenix_orcamentos_history', 'fenix_saved_orcamentos'].forEach((storageKey) => {
     try {
-      const raw = localStorage.getItem(storageKey);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
+      const parsed = getLocalCollectionSafe<any>(storageKey, []);
       if (!Array.isArray(parsed)) return;
       parsed.forEach((orc: any) => {
         if (!orc || !orc.id) return;
@@ -514,58 +519,42 @@ export function loadAllPipelineBudgets(): PipelineBudgetItem[] {
   // 0b. Vendas já confirmadas e ativas em Metas não devem constar como propostas em aberto
   const deletedSet = new Set<string>();
   try {
-    const rawDel = localStorage.getItem('fenix_deleted_vendas_ids');
-    if (rawDel) {
-      const parsedDel = JSON.parse(rawDel);
-      if (Array.isArray(parsedDel)) {
-        parsedDel.forEach((d: any) => deletedSet.add(String(d).trim()));
-      }
+    const parsedDel = getLocalCollectionSafe<any>('fenix_deleted_vendas_ids', []);
+    if (Array.isArray(parsedDel)) {
+      parsedDel.forEach((d: any) => deletedSet.add(String(d).trim()));
     }
   } catch {}
 
   const soldBareIds = new Set<string>();
   const soldFupIds = new Set<string>();
   try {
-    const rawMetas = localStorage.getItem('fenix_metas_sales_db');
-    if (rawMetas) {
-      const parsedMetas = JSON.parse(rawMetas);
-      if (Array.isArray(parsedMetas)) {
-        parsedMetas.forEach((s: any) => {
-          if (!s || isMockSale(s)) return;
-          const sId = String(s.id || '').trim();
-          const sFupId = s.followUpId ? String(s.followUpId).trim() : '';
-          const sOrcId = s.orcamentoId ? String(s.orcamentoId).trim() : '';
-          const sBare = normalizeBareOrcId(sOrcId || (sFupId.startsWith('fup_') ? sFupId : ''));
-          if (
-            (sId && deletedSet.has(sId)) ||
-            (sFupId && deletedSet.has(sFupId)) ||
-            (sOrcId && deletedSet.has(sOrcId)) ||
-            (sBare && (deletedSet.has(sBare) || deletedSet.has(`v_orc_${sBare}`)))
-          ) {
-            return;
-          }
-          if (sBare) soldBareIds.add(sBare);
-          if (sFupId) soldFupIds.add(sFupId);
-        });
-      }
+    const parsedMetas = getLocalCollectionSafe<any>('fenix_metas_sales_db', []);
+    if (Array.isArray(parsedMetas)) {
+      parsedMetas.forEach((s: any) => {
+        if (!s || isMockSale(s)) return;
+        const sId = String(s.id || '').trim();
+        const sFupId = s.followUpId ? String(s.followUpId).trim() : '';
+        const sOrcId = s.orcamentoId ? String(s.orcamentoId).trim() : '';
+        const sBare = normalizeBareOrcId(sOrcId || (sFupId.startsWith('fup_') ? sFupId : ''));
+        if (
+          (sId && deletedSet.has(sId)) ||
+          (sFupId && deletedSet.has(sFupId)) ||
+          (sOrcId && deletedSet.has(sOrcId)) ||
+          (sBare && (deletedSet.has(sBare) || deletedSet.has(`v_orc_${sBare}`)))
+        ) {
+          return;
+        }
+        if (sBare) soldBareIds.add(sBare);
+        if (sFupId) soldFupIds.add(sFupId);
+      });
     }
   } catch {}
 
   // 1. Esteira de Follow-up (fonte primária dos cards e propostas ativas)
   try {
-    let parsedFup: any[] = [];
-    const rawFupV2 = localStorage.getItem('fenix_followup_cards_v2');
-    if (rawFupV2) {
-      const p = JSON.parse(rawFupV2);
-      if (Array.isArray(p)) parsedFup = p;
-    }
-    if (parsedFup.length === 0) {
-      const rawFupLegacy = localStorage.getItem('fenix_followup_db');
-      if (rawFupLegacy) {
-        const p = JSON.parse(rawFupLegacy);
-        if (Array.isArray(p)) parsedFup = p;
-      }
-    }
+    const parsedFupV2 = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+    const parsedFup =
+      parsedFupV2.length > 0 ? parsedFupV2 : getLocalCollectionSafe<any>('fenix_followup_db', []);
 
     parsedFup.forEach((it: any) => {
       if (!it || !it.id) return;
@@ -745,16 +734,13 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
   const map = new Map<string, VendaItem>();
   const seenKeys = new Set<string>();
 
-  const deletedRaw = localStorage.getItem('fenix_deleted_vendas_ids');
   const deletedSet = new Set<string>();
-  if (deletedRaw) {
-    try {
-      const parsedDel = JSON.parse(deletedRaw);
-      if (Array.isArray(parsedDel)) {
-        parsedDel.forEach((d: any) => deletedSet.add(String(d).trim()));
-      }
-    } catch {}
-  }
+  try {
+    const parsedDel = getLocalCollectionSafe<any>('fenix_deleted_vendas_ids', []);
+    if (Array.isArray(parsedDel)) {
+      parsedDel.forEach((d: any) => deletedSet.add(String(d).trim()));
+    }
+  } catch {}
 
   const toLocalDateYYYYMMDD = (val?: string): string => {
     const now = new Date();
@@ -819,10 +805,9 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
 
   // 1. Vendas cadastradas diretamente em Metas (e já salvas no banco)
   try {
-    const rawMetas = localStorage.getItem('fenix_metas_sales_db');
-    if (rawMetas) {
-      const parsed = JSON.parse(rawMetas);
-      if (Array.isArray(parsed)) {
+    const parsed = getLocalCollectionSafe<any>('fenix_metas_sales_db', []);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      {
         parsed.forEach((item: any, idx: number) => {
           if (!item || isMockSale(item)) return;
           const id = String(item.id || `v_${idx}`);
@@ -907,10 +892,10 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
 
   // 2. Vendas vindas de Follow-ups marcados como "Vendido"
   try {
-    const rawFup = localStorage.getItem('fenix_followup_cards_v2') || localStorage.getItem('fenix_followup_db');
-    if (rawFup) {
-      const parsed = JSON.parse(rawFup);
-      if (Array.isArray(parsed)) {
+    const fupV2 = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+    const parsed = fupV2.length > 0 ? fupV2 : getLocalCollectionSafe<any>('fenix_followup_db', []);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      {
         parsed.forEach((fup: any) => {
           if (!fup || !fup.id) return;
           const statusNorm = String(fup.status || '').trim().toLowerCase();
@@ -1001,10 +986,9 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
 
   // 3. Fallback adicional resiliente: Vendas registradas no Pós-Vendas vindas de Metas
   try {
-    const rawPos = localStorage.getItem('fenix_pos_vendas_db');
-    if (rawPos) {
-      const parsedPos = JSON.parse(rawPos);
-      if (Array.isArray(parsedPos)) {
+    const parsedPos = getLocalCollectionSafe<any>('fenix_pos_vendas_db', []);
+    if (Array.isArray(parsedPos) && parsedPos.length > 0) {
+      {
         parsedPos.forEach((p: any) => {
           if (!p) return;
           const isFromMetas =
@@ -1189,16 +1173,9 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
   }, []);
 
   // Clientes cadastrados para autocomplete/sugestão
-  const [dbClients, setDbClients] = useState<ClientRecord[]>(() => {
-    try {
-      const saved = localStorage.getItem('fenix_clients_db');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {}
-    return [];
-  });
+  const [dbClients, setDbClients] = useState<ClientRecord[]>(() =>
+    getLocalCollectionSafe<ClientRecord>('fenix_clients_db', [])
+  );
 
   // Vendas reais: Consolida vendas cadastradas diretamente em Metas e vendas vindas de Follow-ups vendidos
   const [vendas, setVendas] = useState<VendaItem[]>(() =>
@@ -1219,33 +1196,56 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
         // Atualiza a esteira de orçamentos e propostas
         setPipelineBudgets(loadAllPipelineBudgets());
 
-        const savedClients = localStorage.getItem('fenix_clients_db');
-        if (savedClients) {
-          const parsedC = JSON.parse(savedClients);
-          if (Array.isArray(parsedC)) setDbClients(parsedC);
+        const savedClients = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
+        if (savedClients.length > 0) {
+          setDbClients(savedClients);
         }
       } catch {}
     };
 
-    // Busca remota preventiva do Supabase para garantir que todas as vendas sejam restauradas e exibidas
+    // Busca remota preventiva do Supabase com chaves isoladas (evita timeout e QuotaExceededError)
     const fetchRemoteMetas = async () => {
       try {
         const client = getSupabaseClient();
         if (!client) return;
-        const { data, error } = await client
-          .from('fenix_kv_store')
-          .select('data')
-          .eq('key', 'fenix_metas_sales_db')
-          .maybeSingle();
 
-        if (!error && data && Array.isArray(data.data) && data.data.length > 0) {
-          const raw = localStorage.getItem('fenix_metas_sales_db');
-          let localArr: any[] = [];
-          if (raw) {
-            try {
-              localArr = JSON.parse(raw);
-            } catch {}
+        const { rows, succeededKeys } = await fetchSupabaseKeysIndividually(
+          [
+            'fenix_metas_sales_db',
+            'fenix_followup_cards_v2',
+            'fenix_orcamentos_history',
+            'fenix_saved_orcamentos',
+            'fenix_clients_db',
+            'fenix_pos_vendas_db',
+            'fenix_deleted_vendas_ids',
+          ],
+          15000
+        );
+
+        [
+          'fenix_followup_cards_v2',
+          'fenix_orcamentos_history',
+          'fenix_saved_orcamentos',
+          'fenix_pos_vendas_db',
+          'fenix_deleted_vendas_ids',
+        ].forEach((k) => {
+          if (succeededKeys.has(k) && rows.has(k)) {
+            const val = rows.get(k);
+            if (Array.isArray(val)) {
+              setLocalCollectionSafe(k, val);
+            }
           }
+        });
+
+        if (succeededKeys.has('fenix_clients_db') && Array.isArray(rows.get('fenix_clients_db'))) {
+          const remoteClients = rows.get('fenix_clients_db') as ClientRecord[];
+          setLocalCollectionSafe('fenix_clients_db', remoteClients);
+          setDbClients(remoteClients);
+        }
+
+        const remoteSales = rows.get('fenix_metas_sales_db');
+        if (succeededKeys.has('fenix_metas_sales_db') && Array.isArray(remoteSales) && remoteSales.length > 0) {
+          const localArr = getLocalCollectionSafe<any>('fenix_metas_sales_db', []);
 
           const mergedList: any[] = [];
           const findIdx = (candidate: any): number => {
@@ -1279,7 +1279,7 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
           };
 
           // 1. Registros do banco de dados
-          data.data.forEach((s: any) => {
+          remoteSales.forEach((s: any) => {
             if (!s || isMockSale(s)) return;
             if (findIdx(s) < 0) mergedList.push(s);
           });
@@ -1300,26 +1300,17 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
             }
           });
 
-            if (mergedList.length > 0) {
-              localStorage.setItem('fenix_metas_sales_db', JSON.stringify(mergedList));
-              setVendas(loadConsolidatedMetasSales(currentUserName));
-              window.dispatchEvent(new Event('fenix_metas_updated'));
-              window.dispatchEvent(new Event('fenix_vendas_updated'));
-              window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
-            }
+          if (mergedList.length > 0) {
+            setLocalCollectionSafe('fenix_metas_sales_db', mergedList);
           }
-
-          // Garante também sincronização atualizada da esteira de propostas ativas (Follow-up + Orçamentos)
-          await pullDataFromSupabase([
-            'fenix_followup_cards_v2',
-            'fenix_orcamentos_history',
-            'fenix_saved_orcamentos',
-          ]);
-          setPipelineBudgets(loadAllPipelineBudgets());
-        } catch (err) {
-          console.warn('Erro ao restaurar vendas do Supabase em Metas:', err);
         }
-      };
+
+        setVendas(loadConsolidatedMetasSales(currentUserName));
+        setPipelineBudgets(loadAllPipelineBudgets());
+      } catch (err) {
+        console.warn('Erro ao restaurar vendas e esteira do Supabase em Metas:', err);
+      }
+    };
 
       handleSync();
       fetchRemoteMetas();
@@ -1342,11 +1333,11 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     };
   }, [currentUserName]);
 
-  // Salva no localStorage quando vendas mudar, protegendo contra wipe
+  // Salva no cache seguro/localStorage quando vendas mudar, protegendo contra wipe
   useEffect(() => {
     try {
       if (vendas.length > 0) {
-        localStorage.setItem('fenix_metas_sales_db', JSON.stringify(vendas));
+        setLocalCollectionSafe('fenix_metas_sales_db', vendas);
       }
     } catch {}
   }, [vendas]);
@@ -1838,7 +1829,7 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     setIsAddVendaOpen(false);
 
     try {
-      localStorage.setItem('fenix_metas_sales_db', JSON.stringify(updatedSales));
+      setLocalCollectionSafe('fenix_metas_sales_db', updatedSales);
       window.dispatchEvent(new Event('fenix_metas_updated'));
       saveItemToSupabase('fenix_metas_sales_db', newSale, 'id', currentUserName).catch(() => {});
       syncSingleMetaSaleToVendas(newSale, currentUserName);
@@ -1988,7 +1979,7 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
 
     setVendas(updated);
     try {
-      localStorage.setItem('fenix_metas_sales_db', JSON.stringify(updated));
+      setLocalCollectionSafe('fenix_metas_sales_db', updated);
       window.dispatchEvent(new Event('fenix_metas_updated'));
       const updatedSale = updated.find((v) => v.id === editingVenda.id);
       if (updatedSale) {
@@ -2020,7 +2011,7 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     const updated = vendas.filter((v) => v.id !== deletingVenda.id);
     setVendas(updated);
     try {
-      localStorage.setItem('fenix_metas_sales_db', JSON.stringify(updated));
+      setLocalCollectionSafe('fenix_metas_sales_db', updated);
       window.dispatchEvent(new Event('fenix_metas_updated'));
       deleteItemFromSupabase('fenix_metas_sales_db', targetVenda.id, 'id', currentUserName).catch(() => {});
       removeMetaSaleFromVendas(targetVenda.id, targetVenda.pedido, currentUserName);

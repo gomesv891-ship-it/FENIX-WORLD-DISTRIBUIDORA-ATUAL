@@ -1,5 +1,9 @@
 import { ClientRecord } from '../types';
-import { saveItemToSupabase } from './supabaseClient';
+import {
+  saveItemToSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+} from './supabaseClient';
 
 export const CLIENTS_STORAGE_KEY = 'fenix_clients_db';
 export const ACTIVE_CLIENT_KEY = 'fenix_active_client';
@@ -41,9 +45,7 @@ export function syncUpdatedClientAcrossAllModules(
     updateFn: (item: T) => { updated: boolean; item: T }
   ): boolean => {
     try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return false;
-      const list: T[] = JSON.parse(raw);
+      const list = getLocalCollectionSafe<T>(key, []);
       if (!Array.isArray(list) || list.length === 0) return false;
 
       let changed = false;
@@ -59,7 +61,7 @@ export function syncUpdatedClientAcrossAllModules(
       });
 
       if (changed) {
-        localStorage.setItem(key, JSON.stringify(updatedList));
+        setLocalCollectionSafe(key, updatedList);
         changedItems.forEach((it) => {
           saveItemToSupabase(key, it as any, 'id', currentUserName).catch(() => {});
         });

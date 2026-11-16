@@ -46,7 +46,9 @@ import { filterOrcamentosForUser, getSellerIdForUser, isRecordOfResponsible, isO
 import {
   saveItemToSupabase,
   deleteItemFromSupabase,
-  saveWholeCollectionToSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
 } from '../utils/supabaseClient';
 import { syncSingleOrcamentoToFollowUp } from '../utils/orcamentoFollowUpSync';
 import { getClientTypeVisual } from '../utils/clientTypeVisual';
@@ -87,16 +89,37 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
   onNavigateTab,
   currentUserName = 'Vanessa Gomes',
 }) => {
-  const [orcamentos, setOrcamentos] = useState<SavedOrcamento[]>(() => {
-    try {
-      const raw = localStorage.getItem('fenix_orcamentos_history');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {}
-    return [];
-  });
+  const mergeOrcamentoLists = (primary: SavedOrcamento[], secondary: SavedOrcamento[]): SavedOrcamento[] => {
+    const byId = new Map<string, SavedOrcamento>();
+    const ingest = (list: SavedOrcamento[]) => {
+      if (!Array.isArray(list)) return;
+      list.forEach((orc) => {
+        if (!orc || !orc.id) return;
+        const id = String(orc.id).trim();
+        const existing = byId.get(id);
+        if (!existing) {
+          byId.set(id, orc);
+          return;
+        }
+        const existingTs = new Date(existing.updatedAt || existing.savedAt || 0).getTime() || 0;
+        const incomingTs = new Date(orc.updatedAt || orc.savedAt || 0).getTime() || 0;
+        if (incomingTs >= existingTs) {
+          byId.set(id, { ...existing, ...orc });
+        }
+      });
+    };
+    ingest(secondary);
+    ingest(primary);
+    return Array.from(byId.values());
+  };
+
+  const readMergedLocalOrcamentos = (): SavedOrcamento[] => {
+    const hist = getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []);
+    const saved = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+    return mergeOrcamentoLists(hist, saved);
+  };
+
+  const [orcamentos, setOrcamentos] = useState<SavedOrcamento[]>(() => readMergedLocalOrcamentos());
   const [searchTerm, setSearchTerm] = useState('');
   const [periodMode, setPeriodMode] = useState<'mes' | 'dia' | 'todos'>('todos');
   
@@ -413,38 +436,75 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
     window.open(`https://api.whatsapp.com/send?${phoneParam}text=${textMsg}`, '_blank');
   };
 
-  // Load budgets from localStorage
+  // Load budgets from memory cache + localStorage (merging history & saved)
   const loadOrcamentos = () => {
     try {
-      const rawHistory = localStorage.getItem('fenix_orcamentos_history');
-      const rawSaved = localStorage.getItem('fenix_saved_orcamentos');
-      const raw = rawHistory || rawSaved;
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          setOrcamentos(parsed);
-          return;
-        }
-      }
-      setOrcamentos([]);
+      const merged = readMergedLocalOrcamentos();
+      setOrcamentos(merged);
     } catch {
       setOrcamentos([]);
     }
   };
 
   useEffect(() => {
+    let active = true;
     loadOrcamentos();
+
+    const syncOrcamentosFromSupabase = async () => {
+      try {
+        const { rows, succeededKeys } = await fetchSupabaseKeysIndividually(
+          ['fenix_orcamentos_history', 'fenix_saved_orcamentos'],
+          15000
+        );
+        if (!active) return;
+
+        const remoteHist = succeededKeys.has('fenix_orcamentos_history') && Array.isArray(rows.get('fenix_orcamentos_history'))
+          ? (rows.get('fenix_orcamentos_history') as SavedOrcamento[])
+          : null;
+        const remoteSaved = succeededKeys.has('fenix_saved_orcamentos') && Array.isArray(rows.get('fenix_saved_orcamentos'))
+          ? (rows.get('fenix_saved_orcamentos') as SavedOrcamento[])
+          : null;
+
+        if (remoteHist) {
+          setLocalCollectionSafe('fenix_orcamentos_history', remoteHist);
+        }
+        if (remoteSaved) {
+          setLocalCollectionSafe('fenix_saved_orcamentos', remoteSaved);
+        }
+
+        if (remoteHist || remoteSaved) {
+          const histBase = remoteHist ?? getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []);
+          const savedBase = remoteSaved ?? getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+          const localFallback = readMergedLocalOrcamentos();
+          const mergedRemote = mergeOrcamentoLists(histBase, savedBase);
+          // Preserva qualquer item recém-criado localmente cuja sincronização ainda esteja em trânsito
+          const remoteIds = new Set(mergedRemote.map((o) => String(o.id).trim()));
+          const recentLocal = localFallback.filter((o) => o && o.id && !remoteIds.has(String(o.id).trim()) && (Date.now() - (new Date(o.updatedAt || o.savedAt || 0).getTime() || 0) < 120000));
+          setOrcamentos([...recentLocal, ...mergedRemote]);
+        }
+      } catch (err) {
+        console.warn('Erro ao sincronizar orçamentos do Supabase:', err);
+      }
+    };
+
+    syncOrcamentosFromSupabase();
 
     const handleSync = () => {
       loadOrcamentos();
     };
+    const handleFocus = () => {
+      syncOrcamentosFromSupabase();
+    };
 
     window.addEventListener('storage', handleSync);
     window.addEventListener('fenix_orcamentos_updated', handleSync);
+    window.addEventListener('focus', handleFocus);
 
     return () => {
+      active = false;
       window.removeEventListener('storage', handleSync);
       window.removeEventListener('fenix_orcamentos_updated', handleSync);
+      window.removeEventListener('focus', handleFocus);
     };
   }, []);
 
@@ -710,7 +770,11 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
     syncSingleOrcamentoToFollowUp(duplicated, { currentUser: currentUserName }).catch(() => {});
 
     setOrcamentos(updated);
-    localStorage.setItem('fenix_orcamentos_history', JSON.stringify(updated));
+    const currentHist = getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []);
+    const histUpdated = currentHist.length > 0 ? [duplicated, ...currentHist.filter((o) => o.id !== duplicated.id)] : updated;
+    setLocalCollectionSafe('fenix_orcamentos_history', histUpdated);
+    const currentSaved = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+    setLocalCollectionSafe('fenix_saved_orcamentos', [duplicated, ...currentSaved.filter((o) => o.id !== duplicated.id)]);
     window.dispatchEvent(new Event('fenix_orcamentos_updated'));
     showToast(`✓ Orçamento "${finalName}" criado com sucesso!`);
     setDuplicatingOrcamento(null);
@@ -748,32 +812,27 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
     // Filtra SOMENTE pelo ID específico do orçamento
     const updated = orcamentos.filter((o) => o.id !== id);
     setOrcamentos(updated);
-    localStorage.setItem('fenix_orcamentos_history', JSON.stringify(updated));
-    try {
-      const rawSaved = localStorage.getItem('fenix_saved_orcamentos');
-      if (rawSaved) {
-        const parsedSaved = JSON.parse(rawSaved);
-        if (Array.isArray(parsedSaved)) {
-          localStorage.setItem('fenix_saved_orcamentos', JSON.stringify(parsedSaved.filter((o: any) => o.id !== id)));
-        }
-      }
-    } catch {}
+    setLocalCollectionSafe(
+      'fenix_orcamentos_history',
+      getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', updated).filter((o) => o.id !== id)
+    );
+    const parsedSaved = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+    if (parsedSaved.length > 0) {
+      setLocalCollectionSafe('fenix_saved_orcamentos', parsedSaved.filter((o: any) => o.id !== id));
+    }
     window.dispatchEvent(new Event('fenix_orcamentos_updated'));
 
     // Excluir também o registro correspondente do Follow-up (evitar registros órfãos)
     try {
       await deleteItemFromSupabase('fenix_followup_cards_v2', `fup_${id}`, 'id', currentUserName);
       await deleteItemFromSupabase('fenix_followup_cards_v2', id, 'id', currentUserName);
-      const followUpRaw = localStorage.getItem('fenix_followup_cards_v2');
-      if (followUpRaw) {
-        const followUpList = JSON.parse(followUpRaw);
-        if (Array.isArray(followUpList)) {
-          const filteredFollowUp = followUpList.filter(
-            (f: any) => f.orcamentoId !== id && f.id !== `fup_${id}` && f.id !== id
-          );
-          localStorage.setItem('fenix_followup_cards_v2', JSON.stringify(filteredFollowUp));
-          window.dispatchEvent(new Event('fenix_followup_updated'));
-        }
+      const followUpList = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+      if (followUpList.length > 0) {
+        const filteredFollowUp = followUpList.filter(
+          (f: any) => f.orcamentoId !== id && f.id !== `fup_${id}` && f.id !== id
+        );
+        setLocalCollectionSafe('fenix_followup_cards_v2', filteredFollowUp);
+        window.dispatchEvent(new Event('fenix_followup_updated'));
       }
     } catch (err) {
       console.error('Erro ao excluir registro de follow-up correspondente:', err);
@@ -800,57 +859,56 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
 
     const updated = orcamentos.map((o) => (o.id === id ? updatedOrc : o));
     setOrcamentos(updated);
-    localStorage.setItem('fenix_orcamentos_history', JSON.stringify(updated));
-    try {
-      const rawSaved = localStorage.getItem('fenix_saved_orcamentos');
-      if (rawSaved) {
-        const parsedSaved = JSON.parse(rawSaved);
-        if (Array.isArray(parsedSaved)) {
-          localStorage.setItem('fenix_saved_orcamentos', JSON.stringify(parsedSaved.map((o: any) => o.id === id ? updatedOrc : o)));
-        }
-      }
-    } catch {}
+    const currentHist = getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', updated);
+    setLocalCollectionSafe(
+      'fenix_orcamentos_history',
+      currentHist.some((o) => o.id === id) ? currentHist.map((o) => (o.id === id ? updatedOrc : o)) : [updatedOrc, ...currentHist]
+    );
+    const currentSaved = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+    if (currentSaved.length > 0) {
+      setLocalCollectionSafe(
+        'fenix_saved_orcamentos',
+        currentSaved.some((o: any) => o.id === id) ? currentSaved.map((o: any) => (o.id === id ? updatedOrc : o)) : [updatedOrc, ...currentSaved]
+      );
+    }
     window.dispatchEvent(new Event('fenix_orcamentos_updated'));
 
     // Sincroniza bidirecionalmente com fenix_followup_cards_v2
     try {
-      const followUpRaw = localStorage.getItem('fenix_followup_cards_v2');
-      if (followUpRaw) {
-        const followUpList = JSON.parse(followUpRaw);
-        if (Array.isArray(followUpList)) {
-          const isVendidoStatus = newStatus === 'Fechado' || newStatus === 'Fechados' || newStatus === 'Vendido';
-          const targetStatus = isVendidoStatus
-            ? 'Vendido'
-            : newStatus === 'Perdido' || newStatus === 'Perdidos'
-            ? 'Perdido'
-            : newStatus === 'Negociando'
-            ? 'Negociando'
-            : newStatus === 'Aguardando Retorno' || newStatus === 'Aguardando retorno'
-            ? 'Aguardando Retorno'
-            : 'Orçamento Enviado';
-          
-          let fupChanged = false;
-          const updatedFollowUp = followUpList.map((f: any) => {
-            if (f.orcamentoId === id || f.id === `fup_${id}` || f.id === id) {
-              fupChanged = true;
-              return {
-                ...f,
-                status: targetStatus,
-                dataAtualizacao: new Date().toISOString(),
-                ...(isVendidoStatus ? { lembretesAtivos: false } : {}),
-              };
-            }
-            return f;
-          });
-
-          if (fupChanged) {
-            localStorage.setItem('fenix_followup_cards_v2', JSON.stringify(updatedFollowUp));
-            const updatedFupItem = updatedFollowUp.find((f: any) => f.orcamentoId === id || f.id === `fup_${id}` || f.id === id);
-            if (updatedFupItem) {
-              saveItemToSupabase('fenix_followup_cards_v2', updatedFupItem, 'id', currentUserName).catch(() => {});
-            }
-            window.dispatchEvent(new Event('fenix_followup_updated'));
+      const followUpList = getLocalCollectionSafe<any>('fenix_followup_cards_v2', []);
+      if (followUpList.length > 0) {
+        const isVendidoStatus = newStatus === 'Fechado' || newStatus === 'Fechados' || newStatus === 'Vendido';
+        const targetStatus = isVendidoStatus
+          ? 'Vendido'
+          : newStatus === 'Perdido' || newStatus === 'Perdidos'
+          ? 'Perdido'
+          : newStatus === 'Negociando'
+          ? 'Negociando'
+          : newStatus === 'Aguardando Retorno' || newStatus === 'Aguardando retorno'
+          ? 'Aguardando Retorno'
+          : 'Orçamento Enviado';
+        
+        let fupChanged = false;
+        const updatedFollowUp = followUpList.map((f: any) => {
+          if (f.orcamentoId === id || f.id === `fup_${id}` || f.id === id) {
+            fupChanged = true;
+            return {
+              ...f,
+              status: targetStatus,
+              dataAtualizacao: new Date().toISOString(),
+              ...(isVendidoStatus ? { lembretesAtivos: false } : {}),
+            };
           }
+          return f;
+        });
+
+        if (fupChanged) {
+          setLocalCollectionSafe('fenix_followup_cards_v2', updatedFollowUp);
+          const updatedFupItem = updatedFollowUp.find((f: any) => f.orcamentoId === id || f.id === `fup_${id}` || f.id === id);
+          if (updatedFupItem) {
+            saveItemToSupabase('fenix_followup_cards_v2', updatedFupItem, 'id', currentUserName).catch(() => {});
+          }
+          window.dispatchEvent(new Event('fenix_followup_updated'));
         }
       }
     } catch (fupSyncErr) {

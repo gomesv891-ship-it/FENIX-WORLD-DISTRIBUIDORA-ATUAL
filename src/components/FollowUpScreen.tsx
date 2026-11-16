@@ -56,6 +56,9 @@ import {
   saveWholeCollectionToSupabase,
   getSupabaseClient,
   safeMergeLists,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
 } from '../utils/supabaseClient';
 import {
   getWhatsAppMessageTemplate,
@@ -81,24 +84,12 @@ import {
 const readLocalOrcamentosSnapshot = (): SavedOrcamento[] => {
   try {
     const map = new Map<string, SavedOrcamento>();
-    const raw1 = localStorage.getItem('fenix_orcamentos_history');
-    if (raw1) {
-      const p1 = JSON.parse(raw1);
-      if (Array.isArray(p1)) {
-        p1.forEach((o) => {
-          if (o && o.id) map.set(o.id, o);
-        });
-      }
-    }
-    const raw2 = localStorage.getItem('fenix_saved_orcamentos');
-    if (raw2) {
-      const p2 = JSON.parse(raw2);
-      if (Array.isArray(p2)) {
-        p2.forEach((o) => {
-          if (o && o.id && !map.has(o.id)) map.set(o.id, o);
-        });
-      }
-    }
+    getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []).forEach((o) => {
+      if (o && o.id) map.set(o.id, o);
+    });
+    getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []).forEach((o) => {
+      if (o && o.id && !map.has(o.id)) map.set(o.id, o);
+    });
     return Array.from(map.values());
   } catch {
     return [];
@@ -380,17 +371,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   // Follow-up budgets list (garante a eliminação de cadastro fantasma)
   const [items, setItems] = useState<FollowUpItem[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed
-            .filter((it: FollowUpItem) => !(it.cliente || '').toLowerCase().includes('roberto silveira'))
-            .map((it: FollowUpItem) => ({
-              ...it,
-              status: normalizeStatus(it.status as string),
-            }));
-        }
+      const parsed = getLocalCollectionSafe<FollowUpItem>(STORAGE_KEY, []);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed
+          .filter((it: FollowUpItem) => !(it.cliente || '').toLowerCase().includes('roberto silveira'))
+          .map((it: FollowUpItem) => ({
+            ...it,
+            status: normalizeStatus(it.status as string),
+          }));
       }
     } catch {
       // ignore
@@ -505,6 +493,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const isPersistingRef = React.useRef(false);
+  const isSyncingRef = React.useRef(false);
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3800);
@@ -659,80 +648,58 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     }
   };
 
-  // Sincronização direta com Supabase (Fonte Primária) e fallback/merge seguro com localStorage
+  // Sincronização direta com Supabase (Fonte Primária) e fallback/merge seguro com cache/localStorage
   const syncWithSupabaseAndStorage = async () => {
-    if (isPersistingRef.current) return;
+    if (isPersistingRef.current || isSyncingRef.current) return;
+    isSyncingRef.current = true;
     try {
-      // 1. Carrega clientes locais previamente disponíveis
-      const storedClients = localStorage.getItem(CLIENTS_STORAGE_KEY);
-      if (storedClients) {
-        try {
-          setClients(JSON.parse(storedClients));
-        } catch {}
+      // 1. Carrega clientes locais/cache previamente disponíveis
+      const cachedClients = getLocalCollectionSafe<ClientRecord>(CLIENTS_STORAGE_KEY, []);
+      if (cachedClients.length > 0) {
+        setClients(cachedClients);
       }
 
-      // 2. Consulta dados reais diretamente do Supabase (kv_store)
+      // 2. Consulta dados reais diretamente do Supabase de forma isolada por chave pesada (evita timeouts)
       const client = getSupabaseClient();
       let remoteFup: FollowUpItem[] = [];
       let remoteOrcs: any[] = [];
       let remoteClients: any[] = [];
+      let remoteFupSucceeded = false;
 
       if (client) {
         try {
-          const { data: rows, error } = await client
-            .from('fenix_kv_store')
-            .select('key, data')
-            .in('key', [STORAGE_KEY, ORCAMENTOS_HISTORY_KEY, ORCAMENTOS_SAVED_KEY, CLIENTS_STORAGE_KEY]);
+          const { rows, succeededKeys } = await fetchSupabaseKeysIndividually(
+            [STORAGE_KEY, ORCAMENTOS_HISTORY_KEY, ORCAMENTOS_SAVED_KEY, CLIENTS_STORAGE_KEY],
+            15000
+          );
+          remoteFupSucceeded = succeededKeys.has(STORAGE_KEY);
 
-          if (!error && Array.isArray(rows)) {
-            rows.forEach((r) => {
-              let rData = r.data;
-              if (typeof rData === 'string') {
-                try {
-                  rData = JSON.parse(rData);
-                } catch {}
-              }
-              if (r.key === STORAGE_KEY && Array.isArray(rData)) remoteFup = rData;
-              if ((r.key === ORCAMENTOS_HISTORY_KEY || r.key === ORCAMENTOS_SAVED_KEY) && Array.isArray(rData)) {
-                remoteOrcs = [...remoteOrcs, ...rData];
-              }
-              if (r.key === CLIENTS_STORAGE_KEY && Array.isArray(rData)) remoteClients = rData;
-            });
-          }
+          const rFup = rows.get(STORAGE_KEY);
+          if (Array.isArray(rFup)) remoteFup = rFup;
+
+          const rHist = rows.get(ORCAMENTOS_HISTORY_KEY);
+          if (Array.isArray(rHist)) remoteOrcs = [...remoteOrcs, ...rHist];
+
+          const rSaved = rows.get(ORCAMENTOS_SAVED_KEY);
+          if (Array.isArray(rSaved)) remoteOrcs = [...remoteOrcs, ...rSaved];
+
+          const rCli = rows.get(CLIENTS_STORAGE_KEY);
+          if (Array.isArray(rCli)) remoteClients = rCli;
         } catch (err) {
           console.warn('Erro ao consultar Supabase direto no Follow-up:', err);
         }
       }
 
-      // 3. Fallback / Merge seguro com localStorage
-      const localFupRaw = localStorage.getItem(STORAGE_KEY);
-      let localFup: FollowUpItem[] = [];
-      if (localFupRaw) {
-        try {
-          const p = JSON.parse(localFupRaw);
-          if (Array.isArray(p)) localFup = p;
-        } catch {}
-      }
-
-      const localOrcsRaw = localStorage.getItem(ORCAMENTOS_HISTORY_KEY);
-      const localSavedRaw = localStorage.getItem(ORCAMENTOS_SAVED_KEY);
-      let localOrcs: any[] = [];
-      if (localOrcsRaw) {
-        try {
-          const p = JSON.parse(localOrcsRaw);
-          if (Array.isArray(p)) localOrcs = [...localOrcs, ...p];
-        } catch {}
-      }
-      if (localSavedRaw) {
-        try {
-          const p = JSON.parse(localSavedRaw);
-          if (Array.isArray(p)) localOrcs = [...localOrcs, ...p];
-        } catch {}
-      }
+      // 3. Fallback / Merge seguro com cache em memória + localStorage
+      const localFup: FollowUpItem[] = getLocalCollectionSafe<FollowUpItem>(STORAGE_KEY, []);
+      const localOrcs: any[] = [
+        ...getLocalCollectionSafe<any>(ORCAMENTOS_HISTORY_KEY, []),
+        ...getLocalCollectionSafe<any>(ORCAMENTOS_SAVED_KEY, []),
+      ];
 
       if (remoteClients.length > 0) {
         setClients(remoteClients);
-        localStorage.setItem(CLIENTS_STORAGE_KEY, JSON.stringify(remoteClients));
+        setLocalCollectionSafe(CLIENTS_STORAGE_KEY, remoteClients);
       }
 
       // Merge de coleções preservando sempre a versão mais recente (por updatedAt/savedAt)
@@ -984,24 +951,31 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
 
       currentItems = deduplicateFollowUpList(currentItems);
 
-      // 5. Salva estado sincronizado
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(currentItems));
-      localStorage.setItem(ORCAMENTOS_HISTORY_KEY, JSON.stringify(mergedOrcs));
+      // 5. Atualiza React state PRIMEIRO (garante UI sempre populada mesmo se localStorage atingir cota!)
       setAllOrcamentos(mergedOrcs);
       setItems(currentItems);
 
-      if (updated && client) {
+      setLocalCollectionSafe(STORAGE_KEY, currentItems);
+      setLocalCollectionSafe(ORCAMENTOS_HISTORY_KEY, mergedOrcs);
+
+      if (updated && remoteFupSucceeded && client && currentItems.length > 0) {
         saveWholeCollectionToSupabase(STORAGE_KEY, currentItems, currentUserName).catch(() => {});
       }
     } catch (err) {
       console.error('Erro na sincronização de dados:', err);
+    } finally {
+      isSyncingRef.current = false;
     }
   };
 
   useEffect(() => {
-    syncWithSupabaseAndStorage();
-    // Sincroniza retroativamente todos os orçamentos antigos já salvos no sistema
-    syncAllSavedOrcamentosToFollowUp({ currentUser: currentUserName }).catch(() => {});
+    syncWithSupabaseAndStorage()
+      .then(() => {
+        if (!isPersistingRef.current) {
+          return syncAllSavedOrcamentosToFollowUp({ currentUser: currentUserName });
+        }
+      })
+      .catch(() => {});
 
     const handleSync = () => {
       syncWithSupabaseAndStorage();
@@ -1022,13 +996,13 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     };
   }, []);
 
-  // Salva no localStorage e central Supabase quando itens atualizam
+  // Salva no cache seguro/localStorage e central Supabase quando itens atualizam
   const persistItems = (newItems: FollowUpItem[], singleItemToSave?: FollowUpItem) => {
     isPersistingRef.current = true;
     const dedupedNewItems = deduplicateFollowUpList(newItems);
     setItems(dedupedNewItems);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(dedupedNewItems));
+      setLocalCollectionSafe(STORAGE_KEY, dedupedNewItems);
       if (singleItemToSave) {
         saveItemToSupabase(STORAGE_KEY, singleItemToSave, 'id', currentUserName).catch(() => {});
 
@@ -1062,11 +1036,9 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           );
 
           const syncOrcKey = (key: string) => {
-            const rawOrcs = localStorage.getItem(key);
-            if (!rawOrcs) return;
+            const orcs = getLocalCollectionSafe<any>(key, []);
+            if (orcs.length === 0) return;
             try {
-              const orcs: any[] = JSON.parse(rawOrcs);
-              if (!Array.isArray(orcs)) return;
               let matchedOrc: any = null;
               const updatedOrcs = orcs.map((o) => {
                 if (o && (o.id === orcId || o.id === bareOrcId || String(o.id).replace(/^orc_/, '') === bareOrcId)) {
@@ -1082,7 +1054,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                 return o;
               });
               if (matchedOrc) {
-                localStorage.setItem(key, JSON.stringify(updatedOrcs));
+                setLocalCollectionSafe(key, updatedOrcs);
                 saveItemToSupabase(key, matchedOrc, 'id', currentUserName).catch(() => {});
               }
             } catch {}
@@ -1115,9 +1087,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           : [updatedItem, ...items];
       const deduped = deduplicateFollowUpList(nextList);
       setItems(deduped);
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(deduped));
-      } catch {}
+      setLocalCollectionSafe(STORAGE_KEY, deduped);
       await saveItemToSupabase(STORAGE_KEY, updatedItem, 'id', currentUserName);
       window.dispatchEvent(new Event('fenix_followup_updated'));
     } finally {
@@ -1892,32 +1862,20 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     setTransitioningBudget(null);
   };
 
-  // Helper para carregar todos os orçamentos salvos do localStorage de forma segura
+  // Helper para carregar todos os orçamentos salvos de forma segura (memória/localStorage/state)
   const getAllSavedOrcamentos = (): SavedOrcamento[] => {
     try {
       const map = new Map<string, SavedOrcamento>();
-      const raw1 = localStorage.getItem(ORCAMENTOS_HISTORY_KEY);
-      if (raw1) {
-        const p1 = JSON.parse(raw1);
-        if (Array.isArray(p1)) {
-          p1.forEach((o) => {
-            if (o && o.id) map.set(o.id, o);
-          });
-        }
-      }
-      const raw2 = localStorage.getItem('fenix_saved_orcamentos');
-      if (raw2) {
-        const p2 = JSON.parse(raw2);
-        if (Array.isArray(p2)) {
-          p2.forEach((o) => {
-            if (o && o.id && !map.has(o.id)) map.set(o.id, o);
-          });
-        }
-      }
+      allOrcamentos.forEach((o) => {
+        if (o && o.id) map.set(o.id, o);
+      });
+      readLocalOrcamentosSnapshot().forEach((o) => {
+        if (o && o.id && !map.has(o.id)) map.set(o.id, o);
+      });
       return Array.from(map.values());
     } catch (err) {
       console.error('Erro ao ler orçamentos:', err);
-      return [];
+      return allOrcamentos;
     }
   };
 

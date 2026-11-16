@@ -6,7 +6,13 @@ import {
   calculateCurrentMetasDates,
   normalizeUserMetaKey,
 } from './configOrcamentoEMetas';
-import { getSupabaseClient } from './supabaseClient';
+import {
+  getSupabaseClient,
+  fetchSupabaseKeysIndividually,
+  getLocalCollectionSafe,
+  getLocalRawSafe,
+  setLocalCollectionSafe,
+} from './supabaseClient';
 import {
   isBudgetProposalOfSeller,
   isRecordOfResponsible,
@@ -468,21 +474,37 @@ export async function fetchSimuladorDataFromSupabase(
   }
 
   try {
-    const { data: rows, error } = await client
-      .from('fenix_kv_store')
-      .select('key, data, updated_at')
-      .in('key', [...SIMULADOR_KV_KEYS]);
-
-    if (error) {
-      throw error;
-    }
+    const { rows, succeededKeys } = await fetchSupabaseKeysIndividually([...SIMULADOR_KV_KEYS], 15000);
 
     const kvMap = new Map<string, any>();
-    (rows || []).forEach((row: any) => {
-      if (row && row.key) {
-        kvMap.set(row.key, row.data);
+    for (const key of SIMULADOR_KV_KEYS) {
+      if (succeededKeys.has(key) && rows.has(key)) {
+        const val = rows.get(key);
+        kvMap.set(key, val);
+        if (val !== undefined) {
+          setLocalCollectionSafe(key, val);
+        }
+      } else {
+        // Fallback seguro ao cache em memória / localStorage caso esta chave tenha sofrido instabilidade de rede
+        const rawFallback = getLocalRawSafe(key);
+        if (rawFallback) {
+          try {
+            kvMap.set(key, JSON.parse(rawFallback));
+          } catch {
+            kvMap.set(key, rawFallback);
+          }
+        } else {
+          const listFallback = getLocalCollectionSafe(key, []);
+          if (listFallback.length > 0) {
+            kvMap.set(key, listFallback);
+          }
+        }
       }
-    });
+    }
+
+    if (succeededKeys.size === 0 && kvMap.size === 0) {
+      throw new Error('Não foi possível consultar o Supabase no momento.');
+    }
 
     const individualMetas = parseKvPayload<Partial<IndividualMetasMap>>(
       kvMap.get('fenix_individual_metas_map'),

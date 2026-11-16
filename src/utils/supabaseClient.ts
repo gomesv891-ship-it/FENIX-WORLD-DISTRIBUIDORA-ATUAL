@@ -27,6 +27,113 @@ let supabaseClientInstance: SupabaseClient | null = null;
 let currentClientUrl = '';
 let currentClientKey = '';
 
+// Cache em memória resiliente contra QuotaExceededError do localStorage (~5 MB)
+const memoryCollectionCache = new Map<string, string>();
+const localStorageWriteFailedKeys = new Set<string>();
+
+function evictExpendableLocalStorageCaches(preserveKey?: string) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const keysToCheck: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) keysToCheck.push(k);
+    }
+
+    const expendablePrefixes = ['fenix_test_', 'fenix_orcamento_in_progress_draft'];
+    for (const k of keysToCheck) {
+      if (k === preserveKey) continue;
+      if (expendablePrefixes.some((p) => k.startsWith(p))) {
+        try {
+          localStorage.removeItem(k);
+        } catch {}
+      }
+    }
+
+    // Se houver cópia legada de follow-up e a v2 existir, libera a legada
+    if (preserveKey !== 'fenix_followup_db' && localStorage.getItem('fenix_followup_cards_v2')) {
+      try {
+        localStorage.removeItem('fenix_followup_db');
+      } catch {}
+    }
+
+    // Notificações e histórico de atividades podem crescer muito e têm fonte no Supabase
+    for (const secondaryKey of ['fenix_activities_db', 'fenix_header_notifications_v2']) {
+      if (secondaryKey !== preserveKey) {
+        try {
+          const val = localStorage.getItem(secondaryKey);
+          if (val && val.length > 50000) {
+            if (!memoryCollectionCache.has(secondaryKey)) {
+              memoryCollectionCache.set(secondaryKey, val);
+            }
+            localStorage.removeItem(secondaryKey);
+          }
+        } catch {}
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function setLocalCollectionSafe(key: string, data: any): boolean {
+  const serialized = typeof data === 'string' ? data : JSON.stringify(data);
+  memoryCollectionCache.set(key, serialized);
+
+  if (typeof localStorage === 'undefined') return true;
+  try {
+    localStorage.setItem(key, serialized);
+    localStorageWriteFailedKeys.delete(key);
+    return true;
+  } catch {
+    // Tenta liberar caches secundários/temporários e repetir uma vez
+    evictExpendableLocalStorageCaches(key);
+    try {
+      localStorage.setItem(key, serialized);
+      localStorageWriteFailedKeys.delete(key);
+      return true;
+    } catch {
+      localStorageWriteFailedKeys.add(key);
+      return false;
+    }
+  }
+}
+
+export function getLocalRawSafe(key: string): string | null {
+  const memVal = memoryCollectionCache.get(key) ?? null;
+
+  if (typeof localStorage === 'undefined') {
+    return memVal;
+  }
+
+  if (localStorageWriteFailedKeys.has(key) && memVal !== null) {
+    return memVal;
+  }
+
+  try {
+    const lsVal = localStorage.getItem(key);
+    if (lsVal === null || lsVal === '' || lsVal === '[]') {
+      if (memVal !== null && memVal !== '' && memVal !== '[]') {
+        return memVal;
+      }
+    }
+    return lsVal ?? memVal;
+  } catch {
+    return memVal;
+  }
+}
+
+export function getLocalCollectionSafe<T = any>(key: string, fallback: T[] = []): T[] {
+  try {
+    const raw = getLocalRawSafe(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // Limpeza de segurança defensiva: remover credenciais legadas do localStorage
 if (typeof window !== 'undefined') {
   try {
@@ -866,7 +973,7 @@ export function initSupabaseRealtimeSubscription(): (() => void) | null {
               }
 
               // Proteção anti-sobrescrita: se recebido array vazio e o local tem dados, preservar local!
-              const currentLocalRaw = localStorage.getItem(key);
+              const currentLocalRaw = getLocalRawSafe(key);
               let localList: any[] = [];
               if (currentLocalRaw) {
                 try {
@@ -883,13 +990,13 @@ export function initSupabaseRealtimeSubscription(): (() => void) | null {
                 const merged = safeMergeLists(parsedData, localList, 'id');
                 const stringVal = JSON.stringify(merged);
                 if (currentLocalRaw !== stringVal) {
-                  localStorage.setItem(key, stringVal);
+                  setLocalCollectionSafe(key, stringVal);
                   dispatchCollectionEvents(key);
                 }
               } else {
                 const stringVal = typeof parsedData === 'string' ? parsedData : JSON.stringify(parsedData);
                 if (currentLocalRaw !== stringVal) {
-                  localStorage.setItem(key, stringVal);
+                  setLocalCollectionSafe(key, stringVal);
                   dispatchCollectionEvents(key);
                 }
               }
@@ -953,9 +1060,159 @@ export const TAB_COLLECTIONS_MAP: Record<string, string[]> = {
 
 const moduleLastSyncTime: Record<string, number> = {};
 
+const HEAVY_COLLECTION_KEYS = new Set<string>([
+  'fenix_orcamentos_history',
+  'fenix_saved_orcamentos',
+  'fenix_followup_cards_v2',
+  'fenix_header_notifications_v2',
+  'fenix_clients_db',
+]);
+
+const PROTECTED_MERGE_COLLECTIONS = new Set<string>([
+  'fenix_clients_db',
+  'fenix_orcamentos_history',
+  'fenix_saved_orcamentos',
+  'fenix_followup_cards_v2',
+  'fenix_metas_sales_db',
+  'fenix_pos_vendas_db',
+  'fenix_vendas_gerencial',
+  'fenix_tarefas_db',
+]);
+
+function mergeFollowUpArraysSafe(primaryList: any[], secondaryList: any[]): any[] {
+  const fupByRef = new Map<string, any>();
+  for (const p of [...primaryList, ...secondaryList]) {
+    if (!p) continue;
+    const pId = String(p.id ?? '').trim();
+    const bareOrc = String(p.orcamentoId || (pId.startsWith('fup_') ? pId.slice(4) : ''))
+      .trim()
+      .replace(/^orc_/, '');
+    const refKey = bareOrc ? `orc_${bareOrc}` : pId;
+    if (!refKey) continue;
+
+    const existing = fupByRef.get(refKey);
+    if (!existing) {
+      fupByRef.set(refKey, p);
+    } else {
+      const existingStatus = String(existing.status || '').trim().toLowerCase();
+      const incomingStatus = String(p.status || '').trim().toLowerCase();
+      const existingSold = existingStatus === 'vendido' || existingStatus === 'fechado';
+      const incomingSold = incomingStatus === 'vendido' || incomingStatus === 'fechado';
+
+      const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+      const incomingTs = new Date(p.updatedAt || p.dataAtualizacao || 0).getTime() || 0;
+      const mergedHistMap = new Map<string, any>();
+      [...(existing.historico || []), ...(p.historico || [])].forEach((h: any) => {
+        if (h && h.id) mergedHistMap.set(h.id, h);
+      });
+      const mergedHist = Array.from(mergedHistMap.values()).sort(
+        (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0)
+      );
+      const primary =
+        incomingSold && !existingSold
+          ? p
+          : existingSold && !incomingSold
+          ? existing
+          : incomingTs > existingTs
+          ? p
+          : existing;
+      const secondary = primary === p ? existing : p;
+      fupByRef.set(refKey, {
+        ...secondary,
+        ...primary,
+        id: existing.id || primary.id,
+        orcamentoId: primary.orcamentoId || secondary.orcamentoId,
+        pedido: primary.pedido || secondary.pedido,
+        ...(mergedHist.length > 0 ? { historico: mergedHist } : {}),
+      });
+    }
+  }
+  return Array.from(fupByRef.values());
+}
+
+/**
+ * Busca chaves específicas diretamente no Supabase de forma isolada/paralela (sem timeouts em lotes pesados)
+ * e hidrata o cache em memória + localStorage com proteção anti-QuotaExceededError.
+ */
+export async function fetchSupabaseKeysIndividually(
+  keys: string[],
+  timeoutMs = 15000
+): Promise<{
+  rows: Map<string, any>;
+  succeededKeys: Set<string>;
+  failedKeys: string[];
+}> {
+  const rows = new Map<string, any>();
+  const succeededKeys = new Set<string>();
+  const failedKeys: string[] = [];
+
+  const client = getSupabaseClient();
+  if (!client || !Array.isArray(keys) || keys.length === 0) {
+    return { rows, succeededKeys, failedKeys: keys || [] };
+  }
+
+  const uniqueKeys = Array.from(new Set(keys.filter(Boolean)));
+  const heavyKeys = uniqueKeys.filter((k) => HEAVY_COLLECTION_KEYS.has(k));
+  const lightKeys = uniqueKeys.filter((k) => !HEAVY_COLLECTION_KEYS.has(k));
+
+  const queryBatches: string[][] = [];
+  for (const hk of heavyKeys) {
+    queryBatches.push([hk]);
+  }
+  for (let i = 0; i < lightKeys.length; i += 5) {
+    queryBatches.push(lightKeys.slice(i, i + 5));
+  }
+
+  const fetchBatch = async (batch: string[]) => {
+    const TIMED_OUT = Symbol('TIMED_OUT');
+    try {
+      const res = await withTimeout<any>(
+        executeWithRetry(async () => {
+          const { data, error } = await client
+            .from('fenix_kv_store')
+            .select('key, data, updated_at')
+            .in('key', batch);
+          if (error) throw error;
+          return data || [];
+        }, 2, 500),
+        timeoutMs,
+        TIMED_OUT
+      );
+
+      if (res === TIMED_OUT || !Array.isArray(res)) {
+        batch.forEach((k) => failedKeys.push(k));
+        return;
+      }
+
+      batch.forEach((k) => succeededKeys.add(k));
+      for (const row of res) {
+        if (!row || !row.key) continue;
+        let parsed = row.data;
+        if (typeof parsed === 'string') {
+          try {
+            parsed = JSON.parse(parsed);
+          } catch {}
+        }
+        rows.set(row.key, parsed);
+      }
+    } catch (err) {
+      console.warn(`[SUPABASE-FETCH] Falha ao buscar lote [${batch.join(', ')}]:`, err);
+      batch.forEach((k) => failedKeys.push(k));
+    }
+  };
+
+  // Executa com concorrência máxima de 3 lotes para evitar congestionamento no navegador
+  for (let i = 0; i < queryBatches.length; i += 3) {
+    const group = queryBatches.slice(i, i + 3);
+    await Promise.all(group.map((b) => fetchBatch(b)));
+  }
+
+  return { rows, succeededKeys, failedKeys };
+}
+
 /**
  * Sincroniza em segundo plano apenas os dados da aba/módulo selecionado.
- * Evita carregar o banco inteiro de uma vez e previne consultas repetidas (cache de 15 segundos).
+ * Só atualiza a janela de cache (15s) quando o carregamento concluir sem falhas.
  */
 export async function syncModuleData(tabName: string, force = false): Promise<void> {
   const keys = TAB_COLLECTIONS_MAP[tabName];
@@ -963,39 +1220,47 @@ export async function syncModuleData(tabName: string, force = false): Promise<vo
 
   const now = Date.now();
   if (!force && moduleLastSyncTime[tabName] && now - moduleLastSyncTime[tabName] < 15000) {
-    return; // Sincronizado recentemente, dispensa requisições repetidas
+    return;
   }
-  moduleLastSyncTime[tabName] = now;
 
-  // Carrega apenas as coleções daquele módulo com timeout e de forma não-bloqueante
-  await pullDataFromSupabase(keys);
+  const res = await pullDataFromSupabase(keys);
+  if (res.success) {
+    moduleLastSyncTime[tabName] = Date.now();
+  }
 }
 
 /**
- * Consulta e atualiza uma única coleção do Supabase com timeout seguro de 3 segundos
+ * Consulta e atualiza uma única coleção do Supabase com timeout seguro de 12 segundos
  */
-export async function pullCollectionFromSupabase(key: string, timeoutMs = 3000): Promise<boolean> {
-  const res = await withTimeout(pullDataFromSupabase([key]), timeoutMs, { success: false, pulledCount: 0 });
+export async function pullCollectionFromSupabase(key: string, timeoutMs = 12000): Promise<boolean> {
+  const res = await withTimeout(pullDataFromSupabase([key], timeoutMs), timeoutMs + 1000, {
+    success: false,
+    pulledCount: 0,
+  });
   return res.success;
 }
 
 /**
  * Consulta e atualiza um conjunto específico de coleções do Supabase com timeout seguro
  */
-export async function pullCollectionsFromSupabase(keys: string[], timeoutMs = 4000): Promise<boolean> {
-  const res = await withTimeout(pullDataFromSupabase(keys), timeoutMs, { success: false, pulledCount: 0 });
+export async function pullCollectionsFromSupabase(keys: string[], timeoutMs = 15000): Promise<boolean> {
+  const res = await withTimeout(pullDataFromSupabase(keys, timeoutMs), timeoutMs + 1000, {
+    success: false,
+    pulledCount: 0,
+  });
   return res.success;
 }
 
 /**
- * Pulls data from Supabase into localStorage (Restore / Pull).
- * - Otimizado para consultar coleções em lotes estritos (evita timeout 57014 e tráfego excessivo).
- * - Suporta specificKeys: quando informado, consulta APENAS as chaves necessárias daquele módulo.
- * - Por padrão, não carrega arquivos gigantes (catálogos, documentos pesados) antes do usuário acessar a aba.
- * - Proteção total anti-wipe: nunca sobrescreve dados locais com arrays vazios.
- * - Merge inteligente de registros existentes sem descartar nada.
+ * Pulls data from Supabase into memory cache + localStorage (Restore / Pull).
+ * - Busca chaves pesadas individualmente em paralelo com timeout generoso (15s) em vez de 3.5s.
+ * - Nunca retorna success: true se lotes falharem/expirarem.
+ * - Usa cache em memória seguro para sobreviver a QuotaExceededError no localStorage.
  */
-export async function pullDataFromSupabase(specificKeys?: string[]): Promise<{
+export async function pullDataFromSupabase(
+  specificKeys?: string[],
+  timeoutMs = 15000
+): Promise<{
   success: boolean;
   pulledCount: number;
   error?: string;
@@ -1014,228 +1279,152 @@ export async function pullDataFromSupabase(specificKeys?: string[]): Promise<{
     if (specificKeys && Array.isArray(specificKeys) && specificKeys.length > 0) {
       targetKeys = specificKeys;
     } else {
-      // Exclui coleções muito pesadas no pull genérico (elas serão carregadas sob demanda ao abrir a aba correspondente)
-      const HEAVY_KEYS = new Set<string>();
-      targetKeys = SYNC_COLLECTIONS.filter((c) => !HEAVY_KEYS.has(c.key)).map((c) => c.key);
+      targetKeys = SYNC_COLLECTIONS.map((c) => c.key);
     }
 
-    let allRows: any[] = [];
+    const { rows, failedKeys } = await fetchSupabaseKeysIndividually(targetKeys, timeoutMs);
 
-    // Consulta em chunks pequenos para evitar statement timeout (57014)
-    const chunkSize = 10;
-    for (let i = 0; i < targetKeys.length; i += chunkSize) {
-      const slice = targetKeys.slice(i, i + chunkSize);
-      try {
-        const rowsChunk = await withTimeout(
-          executeWithRetry(async () => {
-            const { data, error } = await client
-              .from('fenix_kv_store')
-              .select('key, data, updated_at')
-              .in('key', slice);
-
-            if (error) throw error;
-            return data || [];
-          }, 2, 400),
-          3500,
-          []
-        );
-
-        if (Array.isArray(rowsChunk)) {
-          allRows = allRows.concat(rowsChunk);
-        }
-      } catch (chunkErr) {
-        console.warn(`[SUPABASE-PULL] Falha não bloqueante ao consultar lote de coleções:`, chunkErr);
-      }
-    }
-
-    if (!Array.isArray(allRows) || allRows.length === 0) {
+    if (rows.size === 0 && failedKeys.length > 0) {
       currentSyncStatus.isSyncing = false;
+      currentSyncStatus.error = 'Timeout ou falha de rede ao consultar Supabase.';
       notifyStatus();
-      drainPendingSyncQueue().catch(() => {});
-      return { success: true, pulledCount: 0 };
+      return {
+        success: false,
+        pulledCount: 0,
+        error: currentSyncStatus.error,
+      };
     }
 
     let pulledCount = 0;
-    for (const item of allRows) {
-      if (item.key && item.data !== undefined) {
-        try {
-          let parsedData = item.data;
-          if (typeof parsedData === 'string') {
-            try {
-              parsedData = JSON.parse(parsedData);
-            } catch {}
-          }
-
-          const currentLocalRaw = localStorage.getItem(item.key);
-          let localList: any[] = [];
-          if (currentLocalRaw) {
-            try {
-              const p = JSON.parse(currentLocalRaw);
-              if (Array.isArray(p)) localList = p;
-            } catch {}
-          }
-
-          let finalData: any = parsedData;
-
-          // PROTEÇÃO TOTAL CONTRA SOBRESCRITA E RESURREIÇÃO DE ITENS EXCLUÍDOS
-          if (Array.isArray(parsedData)) {
-            // Verifica se há itens pendentes na fila offline para esta coleção
-            let pendingItems: any[] = [];
-            try {
-              const rawQ = localStorage.getItem(OFFLINE_SYNC_QUEUE_KEY);
-              if (rawQ) {
-                const q: PendingSyncItem[] = JSON.parse(rawQ);
-                if (Array.isArray(q)) {
-                  pendingItems = q.filter((it) => it.collectionKey === item.key).map((it) => it.item);
-                }
-              }
-            } catch {}
-
-            if (parsedData.length === 0 && localList.length > 0) {
-              // Remote row is empty but local has items: preserve local data and sync it back!
-              finalData = localList;
-              saveWholeCollectionToSupabase(item.key, localList).catch(() => {});
-            } else if (parsedData.length > 0) {
-              if (item.key === 'fenix_metas_sales_db') {
-                const salesList: any[] = [];
-                const findMatchingSaleIdx = (candidate: any): number => {
-                  const id = String(candidate.id || '').trim();
-                  const fupId = candidate.followUpId ? String(candidate.followUpId).trim() : '';
-                  const orcId = candidate.orcamentoId ? String(candidate.orcamentoId).trim() : '';
-                  const bareOrc = orcId.replace(/^orc_/, '');
-                  const cleanPed = candidate.pedido ? String(candidate.pedido).replace(/^#+/, '').trim() : '';
-                  const clientNorm = (candidate.cliente || candidate.clientName || '').trim().toLowerCase();
-
-                  return salesList.findIndex((existing) => {
-                    const eId = String(existing.id || '').trim();
-                    const eFupId = existing.followUpId ? String(existing.followUpId).trim() : '';
-                    const eOrcId = existing.orcamentoId ? String(existing.orcamentoId).trim() : '';
-                    const eBareOrc = eOrcId.replace(/^orc_/, '');
-
-                    if (id && eId && id === eId) return true;
-                    if (fupId && eFupId && fupId === eFupId) return true;
-                    if (bareOrc && eBareOrc && bareOrc === eBareOrc) return true;
-                    if (fupId && eOrcId && (fupId === eOrcId || fupId === `fup_${eBareOrc}`)) return true;
-                    if (orcId && eFupId && (eFupId === orcId || eFupId === `fup_${bareOrc}`)) return true;
-
-                    const ePed = existing.pedido ? String(existing.pedido).replace(/^#+/, '').trim() : '';
-                    const eCli = (existing.cliente || existing.clientName || '').trim().toLowerCase();
-                    const bothHaveDiffOrcs = Boolean(bareOrc && eBareOrc && bareOrc !== eBareOrc);
-                    if (!bothHaveDiffOrcs && cleanPed && ePed && cleanPed === ePed && clientNorm && eCli && clientNorm === eCli) {
-                      return true;
-                    }
-                    return false;
-                  });
-                };
-
-                // Remote parsedData from Supabase enters first
-                for (const p of parsedData) {
-                  if (!p) continue;
-                  const idx = findMatchingSaleIdx(p);
-                  if (idx < 0) salesList.push(p);
-                }
-
-                // Merge local and pending items, preferring whichever has a newer updatedAt timestamp
-                for (const loc of [...localList, ...pendingItems]) {
-                  if (!loc) continue;
-                  const idx = findMatchingSaleIdx(loc);
-                  if (idx < 0) {
-                    salesList.push(loc);
-                  } else {
-                    const existing = salesList[idx];
-                    const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
-                    const locTs = new Date(loc.updatedAt || loc.dataAtualizacao || 0).getTime() || 0;
-                    if (locTs > existingTs) {
-                      salesList[idx] = { ...existing, ...loc, id: existing.id || loc.id };
-                    }
-                  }
-                }
-                finalData = salesList;
-              } else if (item.key === 'fenix_followup_cards_v2') {
-                // Follow-up: manter 1 registro por orcamentoId, preservando edições locais mais recentes (ex: Vendido)
-                const fupByRef = new Map<string, any>();
-                for (const p of [...parsedData, ...localList, ...pendingItems]) {
-                  if (!p) continue;
-                  const pId = String(p.id ?? '').trim();
-                  const bareOrc = String(p.orcamentoId || (pId.startsWith('fup_') ? pId.slice(4) : ''))
-                    .trim()
-                    .replace(/^orc_/, '');
-                  const refKey = bareOrc ? `orc_${bareOrc}` : pId;
-                  if (!refKey) continue;
-
-                  const existing = fupByRef.get(refKey);
-                  if (!existing) {
-                    fupByRef.set(refKey, p);
-                  } else {
-                    const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
-                    const incomingTs = new Date(p.updatedAt || p.dataAtualizacao || 0).getTime() || 0;
-                    const mergedHistMap = new Map<string, any>();
-                    [...(existing.historico || []), ...(p.historico || [])].forEach((h: any) => {
-                      if (h && h.id) mergedHistMap.set(h.id, h);
-                    });
-                    const mergedHist = Array.from(mergedHistMap.values()).sort(
-                      (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0)
-                    );
-                    const primary = incomingTs > existingTs ? p : existing;
-                    const secondary = primary === p ? existing : p;
-                    fupByRef.set(refKey, {
-                      ...secondary,
-                      ...primary,
-                      id: existing.id || primary.id,
-                      orcamentoId: primary.orcamentoId || secondary.orcamentoId,
-                      pedido: primary.pedido || secondary.pedido,
-                      ...(mergedHist.length > 0 ? { historico: mergedHist } : {}),
-                    });
-                  }
-                }
-                finalData = Array.from(fupByRef.values());
-              } else {
-                // Supabase parsedData é a fonte oficial permanente dos dados
-                const map = new Map<string, any>();
-                for (const p of parsedData) {
-                  if (!p) continue;
-                  const pId = String(p.id ?? p.idOrcamento ?? p.codigo ?? p._id ?? p.pedido ?? '').trim();
-                  if (pId) map.set(pId, p);
-                  else map.set(`rem_${Math.random()}`, p);
-                }
-                // Mescla apenas itens offline pendentes que ainda não subiram para o Supabase
-                for (const p of pendingItems) {
-                  if (!p) continue;
-                  const pId = String(p.id ?? p.idOrcamento ?? p.codigo ?? p._id ?? p.pedido ?? '').trim();
-                  if (pId && !map.has(pId)) map.set(pId, p);
-                }
-                finalData = Array.from(map.values());
-              }
-            } else {
-              // O estado retornado pelo Supabase é a fonte da verdade
-              finalData = parsedData;
-            }
-          }
-
-          const stringVal = typeof finalData === 'string' ? finalData : JSON.stringify(finalData);
-
-          // Atualiza e dispara eventos apenas se houver diferença real (previne re-renderizações e flicker)
-          if (currentLocalRaw !== stringVal) {
-            localStorage.setItem(item.key, stringVal);
-            pulledCount++;
-            dispatchCollectionEvents(item.key);
-          }
-        } catch (storageErr) {
-          console.error(`Erro ao gravar ${item.key} no localStorage:`, storageErr);
+    for (const [key, parsedData] of rows.entries()) {
+      if (parsedData === undefined) continue;
+      try {
+        const currentLocalRaw = getLocalRawSafe(key);
+        let localList: any[] = [];
+        if (currentLocalRaw) {
+          try {
+            const p = JSON.parse(currentLocalRaw);
+            if (Array.isArray(p)) localList = p;
+          } catch {}
         }
+
+        let finalData: any = parsedData;
+
+        if (Array.isArray(parsedData)) {
+          let pendingItems: any[] = [];
+          try {
+            const rawQ = getLocalRawSafe(OFFLINE_SYNC_QUEUE_KEY);
+            if (rawQ) {
+              const q: PendingSyncItem[] = JSON.parse(rawQ);
+              if (Array.isArray(q)) {
+                pendingItems = q.filter((it) => it.collectionKey === key).map((it) => it.item);
+              }
+            }
+          } catch {}
+
+          if (parsedData.length === 0 && localList.length > 0) {
+            finalData = localList;
+            saveWholeCollectionToSupabase(key, localList).catch(() => {});
+          } else if (parsedData.length > 0) {
+            if (key === 'fenix_metas_sales_db') {
+              const salesList: any[] = [];
+              const findMatchingSaleIdx = (candidate: any): number => {
+                const id = String(candidate.id || '').trim();
+                const fupId = candidate.followUpId ? String(candidate.followUpId).trim() : '';
+                const orcId = candidate.orcamentoId ? String(candidate.orcamentoId).trim() : '';
+                const bareOrc = orcId.replace(/^orc_/, '');
+                const cleanPed = candidate.pedido ? String(candidate.pedido).replace(/^#+/, '').trim() : '';
+                const clientNorm = (candidate.cliente || candidate.clientName || '').trim().toLowerCase();
+
+                return salesList.findIndex((existing) => {
+                  const eId = String(existing.id || '').trim();
+                  const eFupId = existing.followUpId ? String(existing.followUpId).trim() : '';
+                  const eOrcId = existing.orcamentoId ? String(existing.orcamentoId).trim() : '';
+                  const eBareOrc = eOrcId.replace(/^orc_/, '');
+
+                  if (id && eId && id === eId) return true;
+                  if (fupId && eFupId && fupId === eFupId) return true;
+                  if (bareOrc && eBareOrc && bareOrc === eBareOrc) return true;
+                  if (fupId && eOrcId && (fupId === eOrcId || fupId === `fup_${eBareOrc}`)) return true;
+                  if (orcId && eFupId && (eFupId === orcId || eFupId === `fup_${bareOrc}`)) return true;
+
+                  const ePed = existing.pedido ? String(existing.pedido).replace(/^#+/, '').trim() : '';
+                  const eCli = (existing.cliente || existing.clientName || '').trim().toLowerCase();
+                  const bothHaveDiffOrcs = Boolean(bareOrc && eBareOrc && bareOrc !== eBareOrc);
+                  if (!bothHaveDiffOrcs && cleanPed && ePed && cleanPed === ePed && clientNorm && eCli && clientNorm === eCli) {
+                    return true;
+                  }
+                  return false;
+                });
+              };
+
+              for (const p of parsedData) {
+                if (!p) continue;
+                const idx = findMatchingSaleIdx(p);
+                if (idx < 0) salesList.push(p);
+              }
+
+              for (const loc of [...localList, ...pendingItems]) {
+                if (!loc) continue;
+                const idx = findMatchingSaleIdx(loc);
+                if (idx < 0) {
+                  salesList.push(loc);
+                } else {
+                  const existing = salesList[idx];
+                  const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+                  const locTs = new Date(loc.updatedAt || loc.dataAtualizacao || 0).getTime() || 0;
+                  if (locTs > existingTs) {
+                    salesList[idx] = { ...existing, ...loc, id: existing.id || loc.id };
+                  }
+                }
+              }
+              finalData = salesList;
+            } else if (key === 'fenix_followup_cards_v2') {
+              finalData = mergeFollowUpArraysSafe(parsedData, [...localList, ...pendingItems]);
+            } else {
+              const map = new Map<string, any>();
+              for (const p of parsedData) {
+                if (!p) continue;
+                const pId = String(p.id ?? p.idOrcamento ?? p.codigo ?? p._id ?? p.pedido ?? '').trim();
+                if (pId) map.set(pId, p);
+                else map.set(`rem_${Math.random()}`, p);
+              }
+              for (const p of pendingItems) {
+                if (!p) continue;
+                const pId = String(p.id ?? p.idOrcamento ?? p.codigo ?? p._id ?? p.pedido ?? '').trim();
+                if (pId && !map.has(pId)) map.set(pId, p);
+              }
+              finalData = Array.from(map.values());
+            }
+          } else {
+            finalData = parsedData;
+          }
+        }
+
+        const stringVal = typeof finalData === 'string' ? finalData : JSON.stringify(finalData);
+        if (currentLocalRaw !== stringVal) {
+          setLocalCollectionSafe(key, stringVal);
+          pulledCount++;
+          dispatchCollectionEvents(key);
+        }
+      } catch (storageErr) {
+        console.error(`Erro ao gravar ${key} no cache/storage:`, storageErr);
       }
     }
 
     currentSyncStatus.connected = true;
     currentSyncStatus.lastSyncTime = new Date().toLocaleTimeString('pt-BR');
-    currentSyncStatus.error = null;
+    currentSyncStatus.error = failedKeys.length > 0 ? `Algumas coleções falharam: ${failedKeys.join(', ')}` : null;
     currentSyncStatus.isSyncing = false;
     notifyStatus();
 
-    // Drena a fila offline em background
     drainPendingSyncQueue().catch(() => {});
 
-    return { success: true, pulledCount };
+    return {
+      success: failedKeys.length === 0,
+      pulledCount,
+      ...(failedKeys.length > 0 ? { error: currentSyncStatus.error || undefined } : {}),
+    };
   } catch (err: any) {
     const errorMsg = err?.message || 'Não foi possível carregar os dados. Operando com dados locais.';
     currentSyncStatus.isSyncing = false;
@@ -1316,17 +1505,8 @@ export async function saveItemToSupabase<T extends Record<string, any>>(
         }
       }
 
-      // 2. Lê estado local atual como complemento defensivo
-      let localList: T[] = [];
-      try {
-        if (typeof localStorage !== 'undefined') {
-          const raw = localStorage.getItem(collectionKey);
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) localList = parsed;
-          }
-        }
-      } catch {}
+      // 2. Lê estado local/memória atual como complemento defensivo
+      const localList: T[] = getLocalCollectionSafe<T>(collectionKey, []);
 
       // 3. Mescla com precedência total da base oficial do Supabase
       const baseMap = new Map<string, any>();
@@ -1428,15 +1608,9 @@ export async function saveItemToSupabase<T extends Record<string, any>>(
         throw upsertErr;
       }
 
-      // 6. Confirmação do Supabase: atualiza cache local e notifica componentes
-      try {
-        if (typeof localStorage !== 'undefined') {
-          localStorage.setItem(collectionKey, JSON.stringify(updatedList));
-          dispatchCollectionEvents(collectionKey);
-        }
-      } catch (e) {
-        console.warn('Erro ao atualizar cache local após confirmação Supabase:', e);
-      }
+      // 6. Confirmação do Supabase: atualiza cache em memória + localStorage seguro e notifica componentes
+      setLocalCollectionSafe(collectionKey, updatedList);
+      dispatchCollectionEvents(collectionKey);
 
       return {
         success: true,
@@ -1522,16 +1696,7 @@ export async function deleteItemFromSupabase(
       }
     }
 
-    let localList: any[] = [];
-    try {
-      if (typeof localStorage !== 'undefined') {
-        const raw = localStorage.getItem(collectionKey);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) localList = parsed;
-        }
-      }
-    } catch {}
+    const localList: any[] = getLocalCollectionSafe(collectionKey, []);
 
     const baseMap = new Map<string, any>();
     for (const rem of remoteList) {
@@ -1571,14 +1736,8 @@ export async function deleteItemFromSupabase(
       throw upsertErr;
     }
 
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(collectionKey, JSON.stringify(updatedList));
-        dispatchCollectionEvents(collectionKey);
-      }
-    } catch (e) {
-      console.warn('Erro ao atualizar cache local:', e);
-    }
+    setLocalCollectionSafe(collectionKey, updatedList);
+    dispatchCollectionEvents(collectionKey);
 
     return { success: true };
   }).catch((err) => {
@@ -1612,36 +1771,50 @@ export async function saveWholeCollectionToSupabase(
 
   const user = currentUser || localStorage.getItem('fenix_active_user_name') || localStorage.getItem('fenix_saved_username') || 'Usuário Fênix';
 
-  // 1. ANTI-WIPE PROTECTION:
-  // Se incoming for array vazio, verificar se há dados existentes no cache local ou no Supabase.
-  // NUNCA permitir que um array vazio ou não inicializado apague registros existentes!
+  // 1. ANTI-WIPE PROTECTION (local + memória):
   if (Array.isArray(data) && data.length === 0) {
-    const existingLocal = localStorage.getItem(collectionKey);
-    if (existingLocal) {
-      try {
-        const parsed = JSON.parse(existingLocal);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          console.warn(`[ANTI-WIPE] Bloqueada tentativa de sobrescrever ${collectionKey} com array vazio (${parsed.length} itens preservados).`);
-          return { success: false, error: 'Operação bloqueada por segurança: dados existentes não podem ser apagados em lote.' };
-        }
-      } catch {}
+    const existingLocal = getLocalCollectionSafe(collectionKey, []);
+    if (existingLocal.length > 0) {
+      console.warn(`[ANTI-WIPE] Bloqueada tentativa de sobrescrever ${collectionKey} com array vazio (${existingLocal.length} itens preservados).`);
+      return { success: false, error: 'Operação bloqueada por segurança: dados existentes não podem ser apagados em lote.' };
     }
   }
 
   return executeWithRetry(async () => {
     let dataToSave = Array.isArray(data) ? deduplicateListById(data) : data;
 
-    // Proteção absoluta para fenix_metas_sales_db: nunca truncar ou perder vendas remotas existentes
-    if (collectionKey === 'fenix_metas_sales_db' && Array.isArray(data)) {
-      try {
-        const { data: remoteRow } = await client
-          .from('fenix_kv_store')
-          .select('data')
-          .eq('key', 'fenix_metas_sales_db')
-          .maybeSingle();
+    // 2. PROTEÇÃO REMOTA UNIVERSAL ANTI-TRUNCAMENTO para coleções críticas do CRM:
+    // Consulta o Supabase antes de gravar e faz merge preservando todos os registros remotos existentes.
+    if (PROTECTED_MERGE_COLLECTIONS.has(collectionKey) && Array.isArray(data)) {
+      const { data: remoteRow, error: fetchErr } = await client
+        .from('fenix_kv_store')
+        .select('data')
+        .eq('key', collectionKey)
+        .maybeSingle();
 
-        if (remoteRow && Array.isArray(remoteRow.data) && remoteRow.data.length > 0) {
-          const remoteList = remoteRow.data;
+      if (fetchErr) {
+        throw fetchErr;
+      }
+
+      let remoteList: any[] = [];
+      if (remoteRow && remoteRow.data !== undefined) {
+        let rData = remoteRow.data;
+        if (typeof rData === 'string') {
+          try {
+            rData = JSON.parse(rData);
+          } catch {}
+        }
+        if (Array.isArray(rData)) {
+          remoteList = rData;
+        }
+      }
+
+      if (remoteList.length > 0 && data.length === 0) {
+        throw new Error(`[ANTI-WIPE] Bloqueada sobrescrita vazia em ${collectionKey} (${remoteList.length} registros remotos preservados).`);
+      }
+
+      if (remoteList.length > 0) {
+        if (collectionKey === 'fenix_metas_sales_db') {
           const mergedSales: any[] = [];
           const findIdx = (candidate: any): number => {
             const id = String(candidate.id || '').trim();
@@ -1694,8 +1867,12 @@ export async function saveWholeCollectionToSupabase(
           });
 
           dataToSave = mergedSales;
+        } else if (collectionKey === 'fenix_followup_cards_v2') {
+          dataToSave = mergeFollowUpArraysSafe(remoteList, data);
+        } else {
+          dataToSave = safeMergeLists(remoteList, data, 'id');
         }
-      } catch {}
+      }
     }
 
     const nowIso = new Date().toISOString();
@@ -1717,12 +1894,8 @@ export async function saveWholeCollectionToSupabase(
       throw upsertErr;
     }
 
-    try {
-      localStorage.setItem(collectionKey, typeof dataToSave === 'string' ? dataToSave : JSON.stringify(dataToSave));
-      dispatchCollectionEvents(collectionKey);
-    } catch (e) {
-      console.warn('Erro ao atualizar cache local:', e);
-    }
+    setLocalCollectionSafe(collectionKey, dataToSave);
+    dispatchCollectionEvents(collectionKey);
 
     return { success: true };
   }).catch((err) => {

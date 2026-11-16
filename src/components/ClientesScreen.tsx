@@ -36,8 +36,10 @@ import { ResponsibleFilterTabs } from './ResponsibleFilterTabs';
 import {
   saveItemToSupabase,
   deleteItemFromSupabase,
-  saveWholeCollectionToSupabase,
   getSupabaseClient,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
 } from '../utils/supabaseClient';
 import { syncUpdatedClientAcrossAllModules } from '../utils/clientSyncService';
 
@@ -156,16 +158,12 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Load clients from persistent localStorage
+  // Load clients from safe memory cache + persistent localStorage
   const loadClientsFromStorage = () => {
     try {
-      const stored = localStorage.getItem('fenix_clients_db');
-      if (stored) {
-        const parsed: ClientRecord[] = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setClients(parsed);
-          return;
-        }
+      const parsed = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setClients(parsed);
       }
     } catch {
       // ignore
@@ -185,55 +183,34 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
       const supabase = getSupabaseClient();
       if (!supabase) return;
 
-      const { data, error } = await supabase
-        .from('fenix_kv_store')
-        .select('data')
-        .eq('key', 'fenix_clients_db')
-        .maybeSingle();
+      const { rows, succeededKeys } = await fetchSupabaseKeysIndividually(['fenix_clients_db'], 12000);
+      if (!succeededKeys.has('fenix_clients_db')) return;
 
-      if (!error && data && data.data !== undefined) {
-        let remoteList: ClientRecord[] = [];
-        if (typeof data.data === 'string') {
-          try {
-            remoteList = JSON.parse(data.data);
-          } catch {}
-        } else if (Array.isArray(data.data)) {
-          remoteList = data.data;
-        }
+      const remoteList = rows.get('fenix_clients_db');
+      if (Array.isArray(remoteList)) {
+        // Lê lista local atual para mesclar com segurança (preserva cadastros recém-feitos ou offline)
+        const localList = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
 
-        if (Array.isArray(remoteList)) {
-          // Lê lista local atual para mesclar com segurança (preserva cadastros recém-feitos ou offline)
-          let localList: ClientRecord[] = [];
-          try {
-            const stored = localStorage.getItem('fenix_clients_db');
-            if (stored) {
-              const parsed = JSON.parse(stored);
-              if (Array.isArray(parsed)) localList = parsed;
-            }
-          } catch {}
+        const remoteMap = new Map<string, ClientRecord>();
+        remoteList.forEach((c) => {
+          if (c && c.id) remoteMap.set(String(c.id).trim(), c);
+        });
 
-          const remoteMap = new Map<string, ClientRecord>();
-          remoteList.forEach((c) => {
-            if (c && c.id) remoteMap.set(String(c.id).trim(), c);
-          });
+        // Clientes presentes apenas no dispositivo local que ainda não constam no banco central
+        const localOnly = localList.filter(
+          (c) => c && c.id && !remoteMap.has(String(c.id).trim())
+        );
 
-          // Clientes presentes apenas no dispositivo local que ainda não constam no banco central
-          const localOnly = localList.filter(
-            (c) => c && c.id && !remoteMap.has(String(c.id).trim())
-          );
+        // Mescla segura e unificada: locais novos seguidos dos remotos
+        const unifiedList = [...localOnly, ...remoteList];
 
-          // Mescla segura e unificada: remotos primeiro, seguidos dos locais novos
-          const unifiedList = [...remoteList, ...localOnly];
+        setClients(unifiedList);
+        setLocalCollectionSafe('fenix_clients_db', unifiedList);
 
-          setClients(unifiedList);
-          try {
-            localStorage.setItem('fenix_clients_db', JSON.stringify(unifiedList));
-          } catch {}
-
-          // Se havia clientes apenas no dispositivo local, envia para o Supabase
-          // garantindo que o outro dispositivo (PC ou Mobile) receba exatamente esses mesmos clientes
-          if (localOnly.length > 0) {
-            saveWholeCollectionToSupabase('fenix_clients_db', unifiedList).catch(() => {});
+        // Envia apenas os registros individuais novos sem sobrescrever a coleção inteira
+        if (localOnly.length > 0) {
+          for (const loc of localOnly) {
+            saveItemToSupabase('fenix_clients_db', loc, 'id', currentUserName).catch(() => {});
           }
         }
       }
@@ -308,7 +285,7 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
 
     setClients(updatedList);
     try {
-      localStorage.setItem('fenix_clients_db', JSON.stringify(updatedList));
+      setLocalCollectionSafe('fenix_clients_db', updatedList);
       saveItemToSupabase('fenix_clients_db', updatedClient, 'id', currentUserName).catch(() => {});
       window.dispatchEvent(new Event('fenix_clients_updated'));
 
@@ -353,13 +330,13 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
     savedClient: ClientRecord,
     action: NovoClienteAction
   ) => {
-    // 1. Atualização persistente e atômica no armazenamento local
+    // 1. Atualização persistente e atômica no armazenamento local / cache seguro
     try {
-      const stored = localStorage.getItem('fenix_clients_db');
-      const currentList: ClientRecord[] = stored ? JSON.parse(stored) : [];
+      const currentList = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
       const updatedList = [savedClient, ...currentList.filter((c) => c.id !== savedClient.id)];
-      localStorage.setItem('fenix_clients_db', JSON.stringify(updatedList));
+      setLocalCollectionSafe('fenix_clients_db', updatedList);
       localStorage.setItem('fenix_active_client', JSON.stringify(savedClient));
+      window.dispatchEvent(new Event('fenix_clients_updated'));
     } catch {}
 
     // 2. Atualização imediata no estado da tela para exibição instantânea
@@ -461,7 +438,7 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
       }
 
       setClients(updatedList);
-      localStorage.setItem('fenix_clients_db', JSON.stringify(updatedList));
+      setLocalCollectionSafe('fenix_clients_db', updatedList);
       window.dispatchEvent(new Event('fenix_clients_updated'));
       const active = localStorage.getItem('fenix_active_client');
       if (active) {
@@ -524,7 +501,7 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
 
       const updatedList = clients.filter((c) => c.id !== clientToDelete.id);
       setClients(updatedList);
-      localStorage.setItem('fenix_clients_db', JSON.stringify(updatedList));
+      setLocalCollectionSafe('fenix_clients_db', updatedList);
       window.dispatchEvent(new Event('fenix_clients_updated'));
 
       const active = localStorage.getItem('fenix_active_client');

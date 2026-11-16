@@ -62,7 +62,12 @@ import { ProductSelectionModal } from './ProductSelectionModal';
 import { ModalCadastrarNovoProdutoOrcamento } from './ModalCadastrarNovoProdutoOrcamento';
 import { EspelhoOrcamento, EspelhoItem } from './EspelhoOrcamento';
 import { filterClientsForUser, isClientOwnedByUser, getSellerIdForUser } from '../utils/userDataFilter';
-import { saveItemToSupabase } from '../utils/supabaseClient';
+import {
+  saveItemToSupabase,
+  getLocalCollectionSafe,
+  setLocalCollectionSafe,
+  fetchSupabaseKeysIndividually,
+} from '../utils/supabaseClient';
 import { syncSingleOrcamentoToFollowUp } from '../utils/orcamentoFollowUpSync';
 import { getOrcamentoExportFileName } from '../utils/orcamentoFileName';
 import {
@@ -268,51 +273,92 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     };
   }, []);
 
-  // Load clients from localStorage (Mostrar SOMENTE clientes cadastrados pelo usuário logado)
+  // Load clients safely from cache/localStorage + Supabase (Mostrar SOMENTE clientes cadastrados pelo usuário logado)
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem('fenix_clients_db');
-      if (stored) {
-        const parsed: ClientRecord[] = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const userClients = parsed.filter((c) => {
-            if (!currentUserName) return true;
-            if (currentUserName.toLowerCase().includes('eder')) return true;
-            return isClientOwnedByUser(c, currentUserName);
-          });
-          setClientsList(userClients);
+    let active = true;
 
-          // Prioriza o cliente do orçamento em edição se disponível
-          if (initialOrcamento?.clientId || initialOrcamento?.clientName) {
-            if (initialOrcamento.clientId) setSelectedClientId(initialOrcamento.clientId);
-            if (initialOrcamento.clientName) setClientSearchQuery(initialOrcamento.clientName);
-            return;
-          }
+    const applyClientsList = (parsed: ClientRecord[]) => {
+      if (!active) return;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const userClients = parsed.filter((c) => {
+          if (!currentUserName) return true;
+          if (currentUserName.toLowerCase().includes('eder')) return true;
+          return isClientOwnedByUser(c, currentUserName);
+        });
+        // Garante que o cliente passado por prop esteja incluído mesmo antes de eventual refetch
+        const withPropClient =
+          client?.id && !userClients.some((c) => c.id === client.id)
+            ? [client, ...userClients]
+            : userClients;
+        setClientsList(withPropClient);
 
-          // Prioriza o cliente explicitamente passado
-          if (client?.id && userClients.some((c) => c.id === client.id)) {
-            setSelectedClientId(client.id);
-            setClientSearchQuery(client.name || '');
-            return;
-          }
-
-          setSelectedClientId((prev) => {
-            if (prev && userClients.some((c) => c.id === prev)) return prev;
-            if (initialDraft?.selectedClientId && userClients.some((c) => c.id === initialDraft.selectedClientId)) {
-              return initialDraft.selectedClientId;
-            }
-            // Não selecionar nenhum cliente automaticamente se for novo orçamento sem vínculo
-            return '';
-          });
+        // Prioriza o cliente do orçamento em edição se disponível
+        if (initialOrcamento?.clientId || initialOrcamento?.clientName) {
+          if (initialOrcamento.clientId) setSelectedClientId(initialOrcamento.clientId);
+          if (initialOrcamento.clientName) setClientSearchQuery(initialOrcamento.clientName);
           return;
         }
+
+        // Prioriza o cliente explicitamente passado
+        if (client?.id && withPropClient.some((c) => c.id === client.id)) {
+          setSelectedClientId(client.id);
+          setClientSearchQuery(client.name || '');
+          return;
+        }
+
+        setSelectedClientId((prev) => {
+          if (prev && withPropClient.some((c) => c.id === prev)) return prev;
+          if (initialDraft?.selectedClientId && withPropClient.some((c) => c.id === initialDraft.selectedClientId)) {
+            return initialDraft.selectedClientId;
+          }
+          return '';
+        });
+        return;
       }
-      setClientsList([]);
-      setSelectedClientId((prev) => prev || '');
-    } catch {
-      setClientsList([]);
-      setSelectedClientId((prev) => prev || '');
+
+      if (client?.id) {
+        setClientsList([client]);
+        setSelectedClientId(client.id);
+        setClientSearchQuery(client.name || '');
+      } else {
+        setClientsList([]);
+        setSelectedClientId((prev) => prev || '');
+      }
+    };
+
+    const loadLocalClients = () => {
+      const parsed = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
+      applyClientsList(parsed);
+      return parsed;
+    };
+
+    const initialParsed = loadLocalClients();
+    if (initialParsed.length === 0) {
+      fetchSupabaseKeysIndividually(['fenix_clients_db'], 12000)
+        .then(({ rows, succeededKeys }) => {
+          if (!active) return;
+          if (succeededKeys.has('fenix_clients_db')) {
+            const remote = rows.get('fenix_clients_db');
+            if (Array.isArray(remote) && remote.length > 0) {
+              setLocalCollectionSafe('fenix_clients_db', remote);
+              applyClientsList(remote);
+            }
+          }
+        })
+        .catch(() => {});
     }
+
+    const handleClientsUpdated = () => {
+      loadLocalClients();
+    };
+    window.addEventListener('fenix_clients_updated', handleClientsUpdated);
+    window.addEventListener('storage', handleClientsUpdated);
+
+    return () => {
+      active = false;
+      window.removeEventListener('fenix_clients_updated', handleClientsUpdated);
+      window.removeEventListener('storage', handleClientsUpdated);
+    };
   }, [client, currentUserName, initialDraft]);
 
   // Current Active Client
@@ -1220,14 +1266,21 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     // Se o cliente estiver cadastrado, persiste a alteração de tipo no cadastro
     if (selectedClientId) {
       try {
-        const stored = localStorage.getItem('fenix_clients_data');
-        if (stored) {
-          const parsed: ClientRecord[] = JSON.parse(stored);
-          const updated = parsed.map((c) =>
-            c.id === selectedClientId ? { ...c, clientType: newType as ClientType } : c
-          );
-          localStorage.setItem('fenix_clients_data', JSON.stringify(updated));
-          setClientsList(updated);
+        const parsed = getLocalCollectionSafe<ClientRecord>('fenix_clients_db', []);
+        if (parsed.length > 0) {
+          const targetClient = parsed.find((c) => c.id === selectedClientId);
+          if (targetClient) {
+            const updatedClient = { ...targetClient, clientType: newType as ClientType };
+            const updatedAll = parsed.map((c) => (c.id === selectedClientId ? updatedClient : c));
+            setLocalCollectionSafe('fenix_clients_db', updatedAll);
+            const userClients = updatedAll.filter((c) => {
+              if (!currentUserName) return true;
+              if (currentUserName.toLowerCase().includes('eder')) return true;
+              return isClientOwnedByUser(c, currentUserName);
+            });
+            setClientsList(userClients);
+            saveItemToSupabase('fenix_clients_db', updatedClient, 'id', currentUserName || consultoraName).catch(() => {});
+          }
         }
       } catch (err) {
         console.error(err);
@@ -3330,21 +3383,19 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       updatedAt: now.toISOString(),
     };
 
-    // 1. Atualização persistente atômica imediata no cache local (0ms de latência visual)
+    // 1. Atualização persistente atômica imediata no cache seguro/local (0ms de latência visual, imune a QuotaExceededError)
     try {
-      const rawHistory = localStorage.getItem('fenix_orcamentos_history');
-      const historyList: SavedOrcamento[] = rawHistory ? JSON.parse(rawHistory) : [];
-      const hIdx = historyList.findIndex((o) => o.id === orcId);
-      if (hIdx >= 0) historyList[hIdx] = orcamentoData;
-      else historyList.unshift(orcamentoData);
-      localStorage.setItem('fenix_orcamentos_history', JSON.stringify(historyList));
+      const historyList = getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []);
+      const nextHistory = historyList.some((o) => o.id === orcId)
+        ? historyList.map((o) => (o.id === orcId ? orcamentoData : o))
+        : [orcamentoData, ...historyList];
+      setLocalCollectionSafe('fenix_orcamentos_history', nextHistory);
 
-      const rawSaved = localStorage.getItem('fenix_saved_orcamentos');
-      const savedList: SavedOrcamento[] = rawSaved ? JSON.parse(rawSaved) : [];
-      const sIdx = savedList.findIndex((o) => o.id === orcId);
-      if (sIdx >= 0) savedList[sIdx] = orcamentoData;
-      else savedList.unshift(orcamentoData);
-      localStorage.setItem('fenix_saved_orcamentos', JSON.stringify(savedList));
+      const savedList = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+      const nextSaved = savedList.some((o) => o.id === orcId)
+        ? savedList.map((o) => (o.id === orcId ? orcamentoData : o))
+        : [orcamentoData, ...savedList];
+      setLocalCollectionSafe('fenix_saved_orcamentos', nextSaved);
     } catch {}
 
     window.dispatchEvent(new Event('fenix_orcamentos_updated'));
