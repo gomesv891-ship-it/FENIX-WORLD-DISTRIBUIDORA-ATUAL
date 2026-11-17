@@ -1,4 +1,5 @@
 import { MaterialRow } from '../types';
+import { optimizePackageCombination } from './colaOptimizer';
 
 export const MANTA_PRODUCTS = [
   'Manta Hospitalar Tarkett 2,0 mm – Rolo 40 m²',
@@ -100,7 +101,8 @@ export function calculatePrimer(area: number): {
 
 /**
  * Optimizes Cola packages (18 kg with 60 m² and 4 kg with 13 m²)
- * to choose the best combination seeking the smallest sobra.
+ * testing all valid combinations seeking the smallest leftover (menor sobra)
+ * and fewest total packages on ties.
  */
 export function calculateCola(area: number): {
   cola18Qty: number;
@@ -108,37 +110,18 @@ export function calculateCola(area: number): {
 } {
   if (area <= 0) return { cola18Qty: 0, cola4Qty: 0 };
 
-  // Option 1: all 18kg buckets
-  const all18Qty = Math.ceil(area / 60);
-  const all18Coverage = all18Qty * 60;
-  const all18Sobra = all18Coverage - area;
+  const result = optimizePackageCombination(area, [
+    { id: 'cola_18', name: 'Cola 18 kg', yieldM2: 60 },
+    { id: 'cola_4', name: 'Cola 4 kg', yieldM2: 13 },
+  ]);
 
-  // Option 2: base 18kg buckets + 4kg complement
-  const base18Qty = Math.floor(area / 60);
-  const rem = area - base18Qty * 60;
-  const comp4Qty = rem > 0 ? Math.ceil(rem / 13) : 0;
-  const compCoverage = base18Qty * 60 + comp4Qty * 13;
-  const compSobra = compCoverage - area;
+  const alloc18 = result.allocations.find((a) => a.id === 'cola_18');
+  const alloc4 = result.allocations.find((a) => a.id === 'cola_4');
 
-  // Option 3: all 4kg if area is small
-  const all4Qty = Math.ceil(area / 13);
-  const all4Coverage = all4Qty * 13;
-  const all4Sobra = all4Coverage - area;
-
-  let best18 = all18Qty;
-  let best4 = 0;
-
-  if (compSobra < all18Sobra && comp4Qty > 0) {
-    best18 = base18Qty;
-    best4 = comp4Qty;
-  }
-
-  if (area < 50 && all4Sobra < all18Sobra && all4Sobra < compSobra) {
-    best18 = 0;
-    best4 = all4Qty;
-  }
-
-  return { cola18Qty: best18, cola4Qty: best4 };
+  return {
+    cola18Qty: alloc18 ? alloc18.quantity : 0,
+    cola4Qty: alloc4 ? alloc4.quantity : 0,
+  };
 }
 
 export function formatBRLNumber(val?: number | null, decimals: number = 2): string {

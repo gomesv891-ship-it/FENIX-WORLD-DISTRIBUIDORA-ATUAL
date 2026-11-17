@@ -42,7 +42,26 @@ export interface EspelhoOrcamentoProps {
   descontoTexto?: string;
   totalFinal: number;
   companyAddress?: string;
+  exibirQuantidade?: boolean;
 }
+
+const stripBoxQuantityText = (raw?: string): string => {
+  if (!raw) return '';
+  return raw
+    .split('\n')
+    .map((line) =>
+      line
+        .replace(
+          /\b\d+\s*(?:caixas?|cxs?)(?:\s*\(\s*[\d.,]+\s*m[²2]\s*\))?(?:\s*\+\s*\d+\s*r[ée]guas?)?/gi,
+          ''
+        )
+        .replace(/^[\s\-|•+/]+|[\s\-|•+/]+$/g, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+    )
+    .filter(Boolean)
+    .join('\n');
+};
 
 export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
   id = 'espelho-oficial-orcamento',
@@ -61,6 +80,7 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
   descontoTexto,
   totalFinal,
   companyAddress,
+  exibirQuantidade = true,
 }) => {
   const formatMoney = (val?: number | null) =>
     (typeof val === 'number' && !isNaN(val) ? val : 0).toLocaleString('pt-BR', {
@@ -276,10 +296,16 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="bg-[#eef5fa] text-[#003865] text-[11px] sm:text-[12px] font-black uppercase tracking-wider border-b border-[#cde2f0]">
-                <th className="py-2.5 px-3 text-center w-[10%] border-r border-[#d4e4f1]">
-                  QTD
-                </th>
-                <th className="py-2.5 px-4 text-center w-[46%] border-r border-[#d4e4f1]">
+                {exibirQuantidade && (
+                  <th className="py-2.5 px-3 text-center w-[10%] border-r border-[#d4e4f1]">
+                    QTD
+                  </th>
+                )}
+                <th
+                  className={`py-2.5 px-4 text-center ${
+                    exibirQuantidade ? 'w-[46%]' : 'w-[56%]'
+                  } border-r border-[#d4e4f1]`}
+                >
                   DESCRIÇÃO DO PRODUTO
                 </th>
                 <th className="py-2.5 px-3 text-center w-[12%] border-r border-[#d4e4f1]">
@@ -297,7 +323,7 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
               {items.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={5}
+                    colSpan={exibirQuantidade ? 5 : 4}
                     className="py-8 text-center text-slate-400 font-medium italic"
                   >
                     Nenhum produto adicionado ao orçamento.
@@ -310,17 +336,22 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
                     className="border-b border-[#e2eef7] last:border-b-0 hover:bg-[#f9fcfe] transition-colors"
                   >
                     {/* QTD */}
-                    <td className="py-2.5 px-3 text-center font-normal text-slate-800 border-r border-[#e2eef7]">
-                      <div>{item.qtd}</div>
-                    </td>
+                    {exibirQuantidade && (
+                      <td className="py-2.5 px-3 text-center font-normal text-slate-800 border-r border-[#e2eef7]">
+                        <div>{item.qtd}</div>
+                      </td>
+                    )}
 
                     {/* DESCRIÇÃO DO PRODUTO + Subtítulo / Detalhe */}
                     <td className="py-2.5 px-4 text-left border-r border-[#e2eef7]">
                       {(() => {
                         const isRodapeItem = isRodapeProduct(item.descricao);
-                        const visibleSubtitulo = isRodapeItem
+                        const baseSubtitulo = isRodapeItem
                           ? stripRodapeAutoDetail(item.subtitulo)
                           : item.subtitulo;
+                        const visibleSubtitulo = exibirQuantidade
+                          ? baseSubtitulo
+                          : stripBoxQuantityText(baseSubtitulo);
                         return (
                           <>
                             <div className="text-slate-900 font-normal leading-tight">
@@ -331,7 +362,8 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
                                 {visibleSubtitulo}
                               </div>
                             )}
-                            {!isRodapeItem &&
+                            {exibirQuantidade &&
+                              !isRodapeItem &&
                               !visibleSubtitulo?.includes(item.qtdDetalhe || '') &&
                               item.qtdDetalhe && (
                                 <div className="text-[10.5px] font-bold text-slate-600 uppercase tracking-wide mt-0.5">

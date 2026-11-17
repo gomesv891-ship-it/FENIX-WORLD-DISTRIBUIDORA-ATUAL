@@ -1,6 +1,15 @@
 import { MaterialRow } from '../types';
 import { getOfficialProducts, getOfficialCategories } from '../data/productCatalog';
 import { extractSuporteCantoCurvoPackMeters } from './orcamentoRapidoCalculator';
+import {
+  ColaPackageAllocation,
+  ColaPackageOption,
+  extractPackageWeightKg,
+  normalizeColaText,
+  optimizePackageCombination,
+  resolveColaProductYieldM2,
+} from './colaOptimizer';
+import { getStoredRendimentos, RendimentoItem } from './rendimentosService';
 
 export function calculateSuporteCantoCurvoEffectiveMl(ml: number, productName?: string): number {
   const safeMl = Math.max(0, Number(ml) || 0);
@@ -656,14 +665,26 @@ export const PRIMER_36L_PRODUCTS: string[] = getLivePrimer36LProducts();
 export function getLiveCola18KgProducts(): string[] {
   try {
     const prods = getOfficialProducts();
-    const matches = prods.filter(
-      (p) =>
-        isProductInTargetCategory(
+    const matches = prods.filter((p) => {
+      if (
+        !isProductInTargetCategory(
           p,
           ['6f8094a3-3698-4e50-adbf-f8d5a5262698', 'cat_cola_piso_vinilico'],
           ['COLA PARA PISO VINÍLICO', 'COLA PARA PISO VINILICO', 'COLAS PARA PISO VINÍLICO']
-        ) && (p.name.includes('18') || p.name.includes('20') || p.name.includes('23'))
-    );
+        )
+      ) {
+        return false;
+      }
+      const w = extractPackageWeightKg(p.name);
+      if (w !== null) {
+        return (
+          Math.abs(w - 18) <= 0.2 ||
+          Math.abs(w - 20) <= 0.2 ||
+          Math.abs(w - 23) <= 0.2
+        );
+      }
+      return /(?<!\d)(?:18|20|23)\s*(?:kg)?\b/i.test(p.name);
+    });
     if (matches.length > 0) return matches.map((p) => p.name);
   } catch {}
   return [];
@@ -674,14 +695,22 @@ export const COLA_18KG_PRODUCTS: string[] = getLiveCola18KgProducts();
 export function getLiveCola4KgProducts(): string[] {
   try {
     const prods = getOfficialProducts();
-    const matches = prods.filter(
-      (p) =>
-        isProductInTargetCategory(
+    const matches = prods.filter((p) => {
+      if (
+        !isProductInTargetCategory(
           p,
           ['6f8094a3-3698-4e50-adbf-f8d5a5262698', 'cat_cola_piso_vinilico'],
           ['COLA PARA PISO VINÍLICO', 'COLA PARA PISO VINILICO', 'COLAS PARA PISO VINÍLICO']
-        ) && (p.name.includes('4') || p.name.includes('3,6') || p.name.includes('3.6'))
-    );
+        )
+      ) {
+        return false;
+      }
+      const w = extractPackageWeightKg(p.name);
+      if (w !== null) {
+        return Math.abs(w - 4) <= 0.2 || Math.abs(w - 3.6) <= 0.2;
+      }
+      return /(?<!\d)(?:3[.,]6|4)\s*(?:kg)?\b/i.test(p.name);
+    });
     if (matches.length > 0) return matches.map((p) => p.name);
   } catch {}
   return [];
@@ -750,45 +779,291 @@ export function calculatePrimer(area: number): {
 }
 
 /**
- * Optimizes Cola packages (18 kg: 60 m² | 4 kg: 13 m²)
- * to choose combination seeking smallest leftover (menor sobra).
+ * Optimizes Cola packages (all registered sizes and individual yields)
+ * to choose the combination with minimum leftover (menor sobra),
+ * breaking ties by fewest total packages.
  */
-export function calculateCola(area: number): {
+export function calculateCola(
+  area: number,
+  options?: {
+    bigYield?: number;
+    smallYield?: number;
+    packages?: ColaPackageOption[];
+    rendimentosOverride?: RendimentoItem[];
+  }
+): {
   cola18Qty: number;
   cola4Qty: number;
+  allocations: ColaPackageAllocation[];
+  totalCoverageM2: number;
+  wasteM2: number;
 } {
-  if (area <= 0) return { cola18Qty: 0, cola4Qty: 0 };
+  if (area <= 0) {
+    return {
+      cola18Qty: 0,
+      cola4Qty: 0,
+      allocations: [],
+      totalCoverageM2: 0,
+      wasteM2: 0,
+    };
+  }
 
-  let bestSobra = Infinity;
-  let best18 = 0;
-  let best4 = 0;
+  const packages: ColaPackageOption[] =
+    options?.packages && options.packages.length > 0
+      ? options.packages
+      : [
+          { id: 'cola_18', name: 'Cola 18 kg', yieldM2: options?.bigYield ?? 60 },
+          { id: 'cola_4', name: 'Cola 4 kg', yieldM2: options?.smallYield ?? 13 },
+        ];
 
-  const max18 = Math.ceil(area / 60) + 1;
-  const max4 = Math.ceil(area / 13) + 1;
+  const result = optimizePackageCombination(area, packages);
+  const alloc18 = result.allocations.find((a) => a.id === 'cola_18');
+  const alloc4 = result.allocations.find((a) => a.id === 'cola_4');
 
-  for (let n18 = 0; n18 <= max18; n18++) {
-    for (let n4 = 0; n4 <= max4; n4++) {
-      const coverage = n18 * 60 + n4 * 13;
-      if (coverage >= area) {
-        const sobra = coverage - area;
-        if (sobra < bestSobra) {
-          bestSobra = sobra;
-          best18 = n18;
-          best4 = n4;
-        } else if (sobra === bestSobra) {
-          if (n18 + n4 < best18 + best4) {
-            best18 = n18;
-            best4 = n4;
-          } else if (n18 + n4 === best18 + best4 && n18 > best18) {
-            best18 = n18;
-            best4 = n4;
-          }
-        }
-      }
+  return {
+    cola18Qty: alloc18 ? alloc18.quantity : 0,
+    cola4Qty: alloc4 ? alloc4.quantity : 0,
+    allocations: result.allocations,
+    totalCoverageM2: result.totalCoverageM2,
+    wasteM2: result.wasteM2,
+  };
+}
+
+function buildDynamicColaMaterialRows(params: {
+  areaM2: number;
+  prefix: 'piso' | 'manta';
+  liveC18Prods: string[];
+  liveC4Prods: string[];
+  getExisting: (id: string) => MaterialRow | undefined;
+  showPlaceholderWhenZero: boolean;
+}): MaterialRow[] {
+  const {
+    areaM2,
+    prefix,
+    liveC18Prods,
+    liveC4Prods,
+    getExisting,
+    showPlaceholderWhenZero,
+  } = params;
+
+  const id18 = `mat_${prefix}_cola_18`;
+  const id4 = `mat_${prefix}_cola_4`;
+  const type18 = `${prefix}_cola_18`;
+  const type4 = `${prefix}_cola_4`;
+
+  const prevC18 = getExisting(id18);
+  const prevC4 = getExisting(id4);
+
+  const selected18 =
+    prevC18?.selectedProduct && liveC18Prods.includes(prevC18.selectedProduct)
+      ? prevC18.selectedProduct
+      : liveC18Prods[0];
+  const selected4 =
+    prevC4?.selectedProduct && liveC4Prods.includes(prevC4.selectedProduct)
+      ? prevC4.selectedProduct
+      : liveC4Prods[0];
+
+  const allProds = (() => {
+    try {
+      return getOfficialProducts();
+    } catch {
+      return [];
+    }
+  })();
+
+  const rendimentos = (() => {
+    try {
+      return getStoredRendimentos();
+    } catch {
+      return [];
+    }
+  })();
+
+  const findOfficialProd = (name?: string) =>
+    name ? allProds.find((p) => p.name === name) : undefined;
+
+  const packages: ColaPackageOption[] = [];
+  const coveredWeights: number[] = [];
+
+  if (selected18) {
+    const prod18 = findOfficialProd(selected18);
+    const yield18 =
+      resolveColaProductYieldM2(prod18 || { name: selected18 }, {
+        rendimentosOverride: rendimentos,
+        defaultYield: 60,
+      }) ?? 60;
+    packages.push({
+      id: id18,
+      name: selected18,
+      yieldM2: yield18,
+      weightKg: extractPackageWeightKg(selected18),
+    });
+    const w = extractPackageWeightKg(selected18);
+    if (w !== null) coveredWeights.push(w);
+  }
+
+  if (selected4) {
+    const prod4 = findOfficialProd(selected4);
+    const yield4 =
+      resolveColaProductYieldM2(prod4 || { name: selected4 }, {
+        rendimentosOverride: rendimentos,
+        defaultYield: 13,
+      }) ?? 13;
+    packages.push({
+      id: id4,
+      name: selected4,
+      yieldM2: yield4,
+      weightKg: extractPackageWeightKg(selected4),
+    });
+    const w = extractPackageWeightKg(selected4);
+    if (w !== null) coveredWeights.push(w);
+  }
+
+  // Descobre quaisquer tamanhos adicionais de embalagem de cola cadastrados no catálogo
+  const extraCatalogColas = allProds.filter((p) => {
+    if (
+      !isProductInTargetCategory(
+        p,
+        ['6f8094a3-3698-4e50-adbf-f8d5a5262698', 'cat_cola_piso_vinilico'],
+        ['COLA PARA PISO VINÍLICO', 'COLA PARA PISO VINILICO', 'COLAS PARA PISO VINÍLICO']
+      )
+    ) {
+      return false;
+    }
+    if (liveC18Prods.includes(p.name) || liveC4Prods.includes(p.name)) {
+      return false;
+    }
+    return true;
+  });
+
+  const extraMeta = new Map<string, { productName: string; options: string[] }>();
+
+  for (const extraProd of extraCatalogColas) {
+    const y = resolveColaProductYieldM2(extraProd, {
+      rendimentosOverride: rendimentos,
+      defaultYield: null,
+    });
+    if (y && y > 0) {
+      const slug = normalizeColaText(extraProd.id || extraProd.name).replace(/[^a-z0-9]+/g, '_');
+      const rowId = `mat_${prefix}_cola_extra_${slug}`;
+      packages.push({
+        id: rowId,
+        name: extraProd.name,
+        yieldM2: y,
+        weightKg: extractPackageWeightKg(extraProd.name),
+      });
+      const w = extractPackageWeightKg(extraProd.name);
+      if (w !== null) coveredWeights.push(w);
+      extraMeta.set(rowId, { productName: extraProd.name, options: [extraProd.name] });
     }
   }
 
-  return { cola18Qty: best18, cola4Qty: best4 };
+  // Também considera embalagens extras cadastradas diretamente na tabela de Rendimentos
+  for (const r of rendimentos) {
+    const rNorm = normalizeColaText(r.produto);
+    if (!rNorm) continue;
+    const isFloorGlueEntry =
+      (rNorm.includes('cola') || rNorm.includes('adesivo')) &&
+      !rNorm.includes('rodape') &&
+      !rNorm.includes('ripado') &&
+      !rNorm.includes('bisnaga') &&
+      !rNorm.includes('acabamento') &&
+      !rNorm.includes('pu');
+    if (!isFloorGlueEntry) continue;
+
+    const rWeight = extractPackageWeightKg(r.produto);
+    // Pesos padrão (3,6/4 kg e 18/20/23 kg) já são atendidos pelas linhas principais
+    const standardBucketWeights = [3.6, 4, 18, 20, 23];
+    if (
+      rWeight !== null &&
+      (standardBucketWeights.some((bw) => Math.abs(bw - rWeight) <= 0.15) ||
+        coveredWeights.some((cw) => Math.abs(cw - rWeight) <= 0.15))
+    ) {
+      continue;
+    }
+    if (
+      packages.some((pk) => {
+        const pkNorm = normalizeColaText(pk.name);
+        return pkNorm === rNorm || pkNorm.includes(rNorm) || rNorm.includes(pkNorm);
+      })
+    ) {
+      continue;
+    }
+
+    const parsedYield = resolveColaProductYieldM2({ name: r.produto }, {
+      rendimentosOverride: [r],
+      defaultYield: null,
+    });
+    if (parsedYield && parsedYield > 0) {
+      const slug = normalizeColaText(r.id || r.produto).replace(/[^a-z0-9]+/g, '_');
+      const rowId = `mat_${prefix}_cola_rend_${slug}`;
+      packages.push({
+        id: rowId,
+        name: r.produto,
+        yieldM2: parsedYield,
+        weightKg: rWeight,
+      });
+      if (rWeight !== null) coveredWeights.push(rWeight);
+      extraMeta.set(rowId, { productName: r.produto, options: [r.produto] });
+    }
+  }
+
+  const opt = optimizePackageCombination(areaM2, packages);
+  const qtyById = new Map(opt.allocations.map((a) => [a.id, a.quantity]));
+  const resultRows: MaterialRow[] = [];
+
+  const q18 = qtyById.get(id18) || 0;
+  if (
+    liveC18Prods.length > 0 &&
+    (q18 > 0 || prevC18?.isCustomQuantity || (showPlaceholderWhenZero && areaM2 === 0 && !prevC4))
+  ) {
+    resultRows.push({
+      id: id18,
+      typeKey: type18,
+      included: prevC18 ? prevC18.included : true,
+      selectedProduct: selected18,
+      productOptions: liveC18Prods,
+      quantity: prevC18?.isCustomQuantity ? prevC18.quantity : String(q18),
+      unit: 'baldes',
+      isCustomQuantity: prevC18?.isCustomQuantity,
+    });
+  }
+
+  const q4 = qtyById.get(id4) || 0;
+  if (liveC4Prods.length > 0 && (q4 > 0 || prevC4?.isCustomQuantity)) {
+    resultRows.push({
+      id: id4,
+      typeKey: type4,
+      included: prevC4 ? prevC4.included : true,
+      selectedProduct: selected4,
+      productOptions: liveC4Prods,
+      quantity: prevC4?.isCustomQuantity ? prevC4.quantity : String(q4),
+      unit: 'baldes',
+      isCustomQuantity: prevC4?.isCustomQuantity,
+    });
+  }
+
+  for (const [rowId, meta] of extraMeta.entries()) {
+    const qExtra = qtyById.get(rowId) || 0;
+    const prevExtra = getExisting(rowId);
+    if (qExtra > 0 || prevExtra?.isCustomQuantity) {
+      resultRows.push({
+        id: rowId,
+        typeKey: `${prefix}_cola_extra`,
+        included: prevExtra ? prevExtra.included : true,
+        selectedProduct:
+          prevExtra?.selectedProduct && meta.options.includes(prevExtra.selectedProduct)
+            ? prevExtra.selectedProduct
+            : meta.productName,
+        productOptions: meta.options,
+        quantity: prevExtra?.isCustomQuantity ? prevExtra.quantity : String(qExtra),
+        unit: 'baldes',
+        isCustomQuantity: prevExtra?.isCustomQuantity,
+      });
+    }
+  }
+
+  return resultRows;
 }
 
 /**
@@ -1041,41 +1316,15 @@ export function generateAllMaterialRows(
 
       // Cola Piso Vinílico (apenas para instalação colada, clicado não utiliza adesivo)
       if (piso.installationType === 'colado') {
-        const { cola18Qty, cola4Qty } = calculateCola(piso.areaM2);
-        const prevC18 = getExisting('mat_piso_cola_18');
-        const prevC4 = getExisting('mat_piso_cola_4');
-
-        if (liveC18Prods.length > 0 && (cola18Qty > 0 || prevC18?.isCustomQuantity)) {
-          rows.push({
-            id: 'mat_piso_cola_18',
-            typeKey: 'piso_cola_18',
-            included: prevC18 ? prevC18.included : true,
-            selectedProduct:
-              prevC18?.selectedProduct && liveC18Prods.includes(prevC18.selectedProduct)
-                ? prevC18.selectedProduct
-                : liveC18Prods[0],
-            productOptions: liveC18Prods,
-            quantity: prevC18?.isCustomQuantity ? prevC18.quantity : String(cola18Qty),
-            unit: 'baldes',
-            isCustomQuantity: prevC18?.isCustomQuantity,
-          });
-        }
-
-        if (liveC4Prods.length > 0 && (cola4Qty > 0 || prevC4?.isCustomQuantity)) {
-          rows.push({
-            id: 'mat_piso_cola_4',
-            typeKey: 'piso_cola_4',
-            included: prevC4 ? prevC4.included : true,
-            selectedProduct:
-              prevC4?.selectedProduct && liveC4Prods.includes(prevC4.selectedProduct)
-                ? prevC4.selectedProduct
-                : liveC4Prods[0],
-            productOptions: liveC4Prods,
-            quantity: prevC4?.isCustomQuantity ? prevC4.quantity : String(cola4Qty),
-            unit: 'baldes',
-            isCustomQuantity: prevC4?.isCustomQuantity,
-          });
-        }
+        const colaRows = buildDynamicColaMaterialRows({
+          areaM2: piso.areaM2,
+          prefix: 'piso',
+          liveC18Prods,
+          liveC4Prods,
+          getExisting,
+          showPlaceholderWhenZero: false,
+        });
+        rows.push(...colaRows);
       }
     }
   }
@@ -1402,42 +1651,16 @@ export function generateAllMaterialRows(
       });
     }
 
-    // Cola (menor sobra)
-    const { cola18Qty, cola4Qty } = calculateCola(manta.areaM2);
-    const prevMantaC18 = getExisting('mat_manta_cola_18');
-    const prevMantaC4 = getExisting('mat_manta_cola_4');
-
-    if (liveC18Prods.length > 0 && (cola18Qty > 0 || prevMantaC18?.isCustomQuantity || (manta.areaM2 === 0 && !prevMantaC4))) {
-      rows.push({
-        id: 'mat_manta_cola_18',
-        typeKey: 'manta_cola_18',
-        included: prevMantaC18 ? prevMantaC18.included : true,
-        selectedProduct:
-          prevMantaC18?.selectedProduct && liveC18Prods.includes(prevMantaC18.selectedProduct)
-            ? prevMantaC18.selectedProduct
-            : liveC18Prods[0],
-        productOptions: liveC18Prods,
-        quantity: prevMantaC18?.isCustomQuantity ? prevMantaC18.quantity : String(cola18Qty),
-        unit: 'baldes',
-        isCustomQuantity: prevMantaC18?.isCustomQuantity,
-      });
-    }
-
-    if (liveC4Prods.length > 0 && (cola4Qty > 0 || prevMantaC4?.isCustomQuantity)) {
-      rows.push({
-        id: 'mat_manta_cola_4',
-        typeKey: 'manta_cola_4',
-        included: prevMantaC4 ? prevMantaC4.included : true,
-        selectedProduct:
-          prevMantaC4?.selectedProduct && liveC4Prods.includes(prevMantaC4.selectedProduct)
-            ? prevMantaC4.selectedProduct
-            : liveC4Prods[0],
-        productOptions: liveC4Prods,
-        quantity: prevMantaC4?.isCustomQuantity ? prevMantaC4.quantity : String(cola4Qty),
-        unit: 'baldes',
-        isCustomQuantity: prevMantaC4?.isCustomQuantity,
-      });
-    }
+    // Cola (menor sobra com todas as embalagens e rendimentos individuais)
+    const mantaColaRows = buildDynamicColaMaterialRows({
+      areaM2: manta.areaM2,
+      prefix: 'manta',
+      liveC18Prods,
+      liveC4Prods,
+      getExisting,
+      showPlaceholderWhenZero: true,
+    });
+    rows.push(...mantaColaRows);
 
     // Cordão de Solda (pertencente a Manta Hospitalar)
     if (liveCordaoProds.length > 0) {

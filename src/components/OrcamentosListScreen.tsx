@@ -430,6 +430,7 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
       descontoValor: orc.descontoValor,
       descontoTexto: orc.descontoTexto,
       numeroOrcamento: orc.nomeOrcamento || orc.id,
+      exibirQuantidade: orc.exibirQuantidade !== false,
     });
     const textMsg = encodeURIComponent(message);
     const phoneParam = rawContact.length >= 10 ? `phone=55${rawContact}&` : '';

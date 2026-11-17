@@ -165,6 +165,7 @@ export interface SavedOrcamento {
   pedido?: string;
   followUpId?: string;
   numeroOrcamento?: string;
+  exibirQuantidade?: boolean;
   savedAt: string;
   updatedAt?: string;
 }

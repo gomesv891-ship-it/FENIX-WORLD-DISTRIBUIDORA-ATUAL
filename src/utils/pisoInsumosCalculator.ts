@@ -7,6 +7,13 @@ import { PriceTableTier } from '../types';
 import { getStoredRendimentos, RendimentoItem } from './rendimentosService';
 
 import { isRodapeProduct } from './rodapeCalculator';
+import {
+  ColaPackageOption,
+  extractPackageWeightKg,
+  normalizeColaText,
+  optimizePackageCombination,
+  resolveColaProductYieldM2,
+} from './colaOptimizer';
 
 export type InsumoKind =
   | 'autonivelante'
@@ -15,6 +22,7 @@ export type InsumoKind =
   | 'primer_antiumidade'
   | 'cola_4'
   | 'cola_18'
+  | 'cola_extra'
   | 'globalfix_36'
   | 'globalfix_20';
 
@@ -407,50 +415,19 @@ export function solveMinimumWastePackages(
     return { bigQty: 0, smallQty: 0, coverage: 0, waste: 0 };
   }
 
-  let bestWaste = Infinity;
-  let bestBig = 0;
-  let bestSmall = 0;
-  let bestCoverage = 0;
-  let bestTotalPacks = Infinity;
+  const result = optimizePackageCombination(area, [
+    { id: 'big', name: 'big', yieldM2: bigYield },
+    { id: 'small', name: 'small', yieldM2: smallYield },
+  ]);
 
-  const maxBig = Math.ceil(area / bigYield) + 1;
-  const maxSmall = Math.ceil(area / smallYield) + 1;
-
-  for (let nBig = 0; nBig <= maxBig; nBig++) {
-    for (let nSmall = 0; nSmall <= maxSmall; nSmall++) {
-      if (nBig === 0 && nSmall === 0) continue;
-      const coverage = Math.round((nBig * bigYield + nSmall * smallYield) * 10000) / 10000;
-      if (coverage >= area - 1e-9) {
-        const waste = Math.max(0, Math.round((coverage - area) * 10000) / 10000);
-        const totalPacks = nBig + nSmall;
-
-        if (waste < bestWaste - 1e-9) {
-          bestWaste = waste;
-          bestBig = nBig;
-          bestSmall = nSmall;
-          bestCoverage = coverage;
-          bestTotalPacks = totalPacks;
-        } else if (Math.abs(waste - bestWaste) <= 1e-9) {
-          if (
-            totalPacks < bestTotalPacks ||
-            (totalPacks === bestTotalPacks && nBig > bestBig)
-          ) {
-            bestWaste = waste;
-            bestBig = nBig;
-            bestSmall = nSmall;
-            bestCoverage = coverage;
-            bestTotalPacks = totalPacks;
-          }
-        }
-      }
-    }
-  }
+  const bigAlloc = result.allocations.find((a) => a.id === 'big');
+  const smallAlloc = result.allocations.find((a) => a.id === 'small');
 
   return {
-    bigQty: bestBig,
-    smallQty: bestSmall,
-    coverage: bestCoverage,
-    waste: bestWaste === Infinity ? 0 : bestWaste,
+    bigQty: bigAlloc ? bigAlloc.quantity : 0,
+    smallQty: smallAlloc ? smallAlloc.quantity : 0,
+    coverage: result.totalCoverageM2,
+    waste: result.wasteM2,
   };
 }
 
@@ -458,7 +435,7 @@ function findCatalogInsumoProduct(
   kind: InsumoKind,
   priceTable: PriceTableTier,
   catalogOverride?: CatalogProduct[]
-): { name: string; unit: string; price: number } {
+): { name: string; unit: string; price: number; description?: string; details?: string } {
   const catalog = catalogOverride ?? getDynamicProductCatalog();
 
   const pickPrice = (
@@ -473,6 +450,8 @@ function findCatalogInsumoProduct(
       name: prod.name,
       unit: prod.unit || fallbackUnit,
       price: getProductTierPrice(prod, priceTable),
+      description: prod.description,
+      details: prod.details,
     };
   };
 
@@ -814,59 +793,213 @@ export function calculatePisoInsumosForOrcamento(params: {
     }
 
     // 3. Cola para Piso (apenas para instalação colada):
-    //    - Tarkett Colado: Globalfix 3,6 kg (12 m²) e 20 kg (75 m²)
-    //    - Demais pisos colados e Manta: 4 kg (13 m²) e 18 kg (60 m²)
+    //    Considera todas as embalagens disponíveis e seus rendimentos individuais,
+    //    escolhendo a combinação com menor sobra possível (empate: menos embalagens).
     if (!skipCola) {
-      if (isTarkettColado(productName)) {
-        const globalfix = solveMinimumWastePackages(insumoBaseSqm, 12, 75);
-        if (globalfix.bigQty > 0) {
-          const cat = findCatalogInsumoProduct('globalfix_20', priceTable, catalogOverride);
-          insumos.push({
-            kind: 'globalfix_20',
-            modalLabel: 'Globalfix 20 kg',
-            quantity: globalfix.bigQty,
-            quantityDisplay: `${globalfix.bigQty} ${globalfix.bigQty === 1 ? 'balde' : 'baldes'}`,
-            catalogName: cat.name,
-            catalogUnit: cat.unit,
-            catalogPrice: cat.price,
-          });
+      const activeCatalog = catalogOverride ?? getDynamicProductCatalog();
+      const activeRendimentos = (() => {
+        if (rendimentosOverride) return rendimentosOverride;
+        try {
+          return getStoredRendimentos();
+        } catch {
+          return [];
         }
-        if (globalfix.smallQty > 0) {
-          const cat = findCatalogInsumoProduct('globalfix_36', priceTable, catalogOverride);
+      })();
+
+      if (isTarkettColado(productName)) {
+        const cat20 = findCatalogInsumoProduct('globalfix_20', priceTable, activeCatalog);
+        const cat36 = findCatalogInsumoProduct('globalfix_36', priceTable, activeCatalog);
+        const yield20 =
+          resolveColaProductYieldM2(cat20, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: 75,
+          }) ?? 75;
+        const yield36 =
+          resolveColaProductYieldM2(cat36, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: 12,
+          }) ?? 12;
+
+        const tarkettPackages: ColaPackageOption[] = [
+          { id: 'globalfix_20', name: cat20.name, yieldM2: yield20 },
+          { id: 'globalfix_36', name: cat36.name, yieldM2: yield36 },
+        ];
+        const pkgMeta = new Map<
+          string,
+          { kind: InsumoKind; modalLabel: string; cat: { name: string; unit: string; price: number } }
+        >([
+          ['globalfix_20', { kind: 'globalfix_20', modalLabel: 'Globalfix 20 kg', cat: cat20 }],
+          ['globalfix_36', { kind: 'globalfix_36', modalLabel: 'Globalfix 3,6 kg', cat: cat36 }],
+        ]);
+
+        // Embalagens extras de Globalfix eventualmente cadastradas
+        const coveredWeights = [3.6, 4, 20, 23];
+        for (const prod of activeCatalog) {
+          const n = normalizeStr(prod.name);
+          if (!n.includes('globalfix')) continue;
+          if (n === normalizeStr(cat20.name) || n === normalizeStr(cat36.name)) continue;
+          const w = extractPackageWeightKg(prod.name);
+          if (w !== null && coveredWeights.some((cw) => Math.abs(cw - w) <= 0.2)) continue;
+          const y = resolveColaProductYieldM2(prod, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: null,
+          });
+          if (y && y > 0) {
+            const id = `extra_${normalizeColaText(prod.id || prod.name)}`;
+            tarkettPackages.push({ id, name: prod.name, yieldM2: y, weightKg: w });
+            if (w !== null) coveredWeights.push(w);
+            pkgMeta.set(id, {
+              kind: 'cola_extra',
+              modalLabel: prod.name,
+              cat: {
+                name: prod.name,
+                unit: prod.unit || 'balde',
+                price: getProductTierPrice(prod, priceTable),
+              },
+            });
+          }
+        }
+
+        const optimized = optimizePackageCombination(insumoBaseSqm, tarkettPackages);
+        for (const alloc of optimized.allocations) {
+          if (alloc.quantity <= 0) continue;
+          const meta = pkgMeta.get(alloc.id);
+          if (!meta) continue;
           insumos.push({
-            kind: 'globalfix_36',
-            modalLabel: 'Globalfix 3,6 kg',
-            quantity: globalfix.smallQty,
-            quantityDisplay: `${globalfix.smallQty} ${globalfix.smallQty === 1 ? 'balde' : 'baldes'}`,
-            catalogName: cat.name,
-            catalogUnit: cat.unit,
-            catalogPrice: cat.price,
+            kind: meta.kind,
+            modalLabel: meta.modalLabel,
+            quantity: alloc.quantity,
+            quantityDisplay: `${alloc.quantity} ${alloc.quantity === 1 ? 'balde' : 'baldes'}`,
+            catalogName: meta.cat.name,
+            catalogUnit: meta.cat.unit,
+            catalogPrice: meta.cat.price,
           });
         }
       } else {
-        const cola = solveMinimumWastePackages(insumoBaseSqm, 13, 60);
-        if (cola.bigQty > 0) {
-          const cat = findCatalogInsumoProduct('cola_18', priceTable, catalogOverride);
-          insumos.push({
-            kind: 'cola_18',
-            modalLabel: 'Cola para Piso 18 kg',
-            quantity: cola.bigQty,
-            quantityDisplay: `${cola.bigQty} ${cola.bigQty === 1 ? 'balde' : 'baldes'}`,
-            catalogName: cat.name,
-            catalogUnit: cat.unit,
-            catalogPrice: cat.price,
+        const cat18 = findCatalogInsumoProduct('cola_18', priceTable, activeCatalog);
+        const cat4 = findCatalogInsumoProduct('cola_4', priceTable, activeCatalog);
+        const yield18 =
+          resolveColaProductYieldM2(cat18, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: 60,
+          }) ?? 60;
+        const yield4 =
+          resolveColaProductYieldM2(cat4, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: 13,
+          }) ?? 13;
+
+        const standardPackages: ColaPackageOption[] = [
+          { id: 'cola_18', name: cat18.name, yieldM2: yield18 },
+          { id: 'cola_4', name: cat4.name, yieldM2: yield4 },
+        ];
+        const pkgMeta = new Map<
+          string,
+          { kind: InsumoKind; modalLabel: string; cat: { name: string; unit: string; price: number } }
+        >([
+          ['cola_18', { kind: 'cola_18', modalLabel: 'Cola para Piso 18 kg', cat: cat18 }],
+          ['cola_4', { kind: 'cola_4', modalLabel: 'Cola para Piso 4 kg', cat: cat4 }],
+        ]);
+
+        // Tamanhos adicionais cadastrados na categoria COLA PARA PISO VINÍLICO ou em Rendimentos
+        const standardWeights = [3.6, 4, 18, 20, 23];
+        const coveredWeights: number[] = [...standardWeights];
+
+        for (const prod of activeCatalog) {
+          const catStr = normalizeStr(prod.category);
+          const pNameNorm = normalizeStr(prod.name);
+          const isColaPisoCat =
+            catStr.includes('cola para piso') ||
+            (pNameNorm.includes('cola') && pNameNorm.includes('piso'));
+          if (!isColaPisoCat || pNameNorm.includes('rodape')) continue;
+          if (pNameNorm === normalizeStr(cat18.name) || pNameNorm === normalizeStr(cat4.name)) continue;
+
+          const w = extractPackageWeightKg(prod.name);
+          if (w !== null && coveredWeights.some((cw) => Math.abs(cw - w) <= 0.2)) continue;
+
+          const y = resolveColaProductYieldM2(prod, {
+            rendimentosOverride: activeRendimentos,
+            defaultYield: null,
           });
+          if (y && y > 0) {
+            const id = `extra_${normalizeColaText(prod.id || prod.name)}`;
+            standardPackages.push({ id, name: prod.name, yieldM2: y, weightKg: w });
+            if (w !== null) coveredWeights.push(w);
+            pkgMeta.set(id, {
+              kind: 'cola_extra',
+              modalLabel: prod.name,
+              cat: {
+                name: prod.name,
+                unit: prod.unit || 'balde',
+                price: getProductTierPrice(prod, priceTable),
+              },
+            });
+          }
         }
-        if (cola.smallQty > 0) {
-          const cat = findCatalogInsumoProduct('cola_4', priceTable, catalogOverride);
+
+        for (const r of activeRendimentos) {
+          const rNorm = normalizeColaText(r.produto);
+          if (!rNorm) continue;
+          const isFloorGlue =
+            (rNorm.includes('cola') || rNorm.includes('adesivo')) &&
+            !rNorm.includes('rodape') &&
+            !rNorm.includes('ripado') &&
+            !rNorm.includes('bisnaga') &&
+            !rNorm.includes('acabamento') &&
+            !rNorm.includes('pu') &&
+            !rNorm.includes('globalfix') &&
+            !rNorm.includes('tack permanente');
+          if (!isFloorGlue) continue;
+
+          const w = extractPackageWeightKg(r.produto);
+          if (w !== null && coveredWeights.some((cw) => Math.abs(cw - w) <= 0.2)) continue;
+          if (
+            standardPackages.some((pk) => {
+              const pkNorm = normalizeColaText(pk.name);
+              return pkNorm === rNorm || pkNorm.includes(rNorm) || rNorm.includes(pkNorm);
+            })
+          ) {
+            continue;
+          }
+
+          const y = resolveColaProductYieldM2(
+            { name: r.produto },
+            { rendimentosOverride: [r], defaultYield: null }
+          );
+          if (y && y > 0) {
+            const matchedCat = activeCatalog.find(
+              (c) => normalizeStr(c.name) === normalizeStr(r.produto)
+            );
+            const id = `extra_rend_${normalizeColaText(r.id || r.produto)}`;
+            standardPackages.push({ id, name: r.produto, yieldM2: y, weightKg: w });
+            if (w !== null) coveredWeights.push(w);
+            pkgMeta.set(id, {
+              kind: 'cola_extra',
+              modalLabel: r.produto,
+              cat: matchedCat
+                ? {
+                    name: matchedCat.name,
+                    unit: matchedCat.unit || 'balde',
+                    price: getProductTierPrice(matchedCat, priceTable),
+                  }
+                : { name: r.produto, unit: 'balde', price: 0 },
+            });
+          }
+        }
+
+        const optimized = optimizePackageCombination(insumoBaseSqm, standardPackages);
+        for (const alloc of optimized.allocations) {
+          if (alloc.quantity <= 0) continue;
+          const meta = pkgMeta.get(alloc.id);
+          if (!meta) continue;
           insumos.push({
-            kind: 'cola_4',
-            modalLabel: 'Cola para Piso 4 kg',
-            quantity: cola.smallQty,
-            quantityDisplay: `${cola.smallQty} ${cola.smallQty === 1 ? 'balde' : 'baldes'}`,
-            catalogName: cat.name,
-            catalogUnit: cat.unit,
-            catalogPrice: cat.price,
+            kind: meta.kind,
+            modalLabel: meta.modalLabel,
+            quantity: alloc.quantity,
+            quantityDisplay: `${alloc.quantity} ${alloc.quantity === 1 ? 'balde' : 'baldes'}`,
+            catalogName: meta.cat.name,
+            catalogUnit: meta.cat.unit,
+            catalogPrice: meta.cat.price,
           });
         }
       }

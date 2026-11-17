@@ -282,6 +282,7 @@ export const ModalVerOrcamentoFollowUp: React.FC<ModalVerOrcamentoFollowUpProps>
       numeroOrcamento: selectedOrcamento.nomeOrcamento || followUp?.pedido,
       totalFinal: selectedOrcamento.totalFinal,
       items: selectedOrcamento.items,
+      exibirQuantidade: selectedOrcamento.exibirQuantidade !== false,
     });
 
     const encoded = encodeURIComponent(message);
@@ -517,6 +518,7 @@ export const ModalVerOrcamentoFollowUp: React.FC<ModalVerOrcamentoFollowUpProps>
             descontoValor={selectedOrcamento.descontoValor && selectedOrcamento.descontoValor > 0 ? selectedOrcamento.descontoValor : undefined}
             descontoTexto={selectedOrcamento.descontoTexto}
             totalFinal={Number(selectedOrcamento.totalFinal) || Number(followUp?.valor) || 0}
+            exibirQuantidade={selectedOrcamento.exibirQuantidade !== false}
           />
         </div>
       </div>

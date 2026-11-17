@@ -571,7 +571,7 @@ export function syncPisoInsumosInItemsList(params: {
       rendimentosOverride,
     });
     for (const line of colaPlan.insumos) {
-      if (line.kind === 'cola_18' || line.kind === 'cola_4') {
+      if (line.kind === 'cola_18' || line.kind === 'cola_4' || line.kind === 'cola_extra') {
         desiredLines.push(line);
       }
     }
@@ -588,7 +588,7 @@ export function syncPisoInsumosInItemsList(params: {
       rendimentosOverride,
     });
     for (const line of tarkettColaPlan.insumos) {
-      if (line.kind === 'globalfix_20' || line.kind === 'globalfix_36') {
+      if (line.kind === 'globalfix_20' || line.kind === 'globalfix_36' || line.kind === 'cola_extra') {
         desiredLines.push(line);
       }
     }

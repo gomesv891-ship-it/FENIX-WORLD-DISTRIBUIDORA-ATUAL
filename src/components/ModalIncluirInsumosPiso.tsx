@@ -57,8 +57,8 @@ export const ModalIncluirInsumosPiso: React.FC<ModalIncluirInsumosPisoProps> = (
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {plan.insumos.map((item) => (
-                  <tr key={item.kind} className="bg-white">
+                {plan.insumos.map((item, idx) => (
+                  <tr key={`${item.kind}_${idx}`} className="bg-white">
                     <td className="py-2.5 px-4 font-semibold text-slate-800">
                       {item.modalLabel}
                     </td>

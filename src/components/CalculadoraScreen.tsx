@@ -59,6 +59,7 @@ import {
 import { addClientActivity } from '../utils/activities';
 import { filterClientsForUser } from '../utils/userDataFilter';
 import { ModalRendimentos } from './calculadora/ModalRendimentos';
+import { loadRendimentosFromSupabase } from '../utils/rendimentosService';
 
 interface CalculadoraScreenProps {
   client: ClientRecord | null;
@@ -363,17 +364,39 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
   const [expManta, setExpManta] = useState(false);
 
   // =========================================================
-  // CATÁLOGO REAL E DINÂMICO (CRM / GOOGLE SHEETS)
+  // CATÁLOGO REAL E DINÂMICO (CRM / GOOGLE SHEETS / RENDIMENTOS)
   // =========================================================
-  const livePisoProducts = useMemo(() => getLivePisoProducts(), []);
-  const liveRodapeProducts = useMemo(() => getLiveRodapeProducts(), []);
-  const liveTetoProducts = useMemo(() => getLiveTetoProducts(), []);
-  const liveTetoPerfilProducts = useMemo(() => getLiveTetoPerfilProducts(), []);
-  const liveRipadoProducts = useMemo(() => getLiveRipadoProducts(), []);
-  const liveRipadoPerfilProducts = useMemo(() => getLiveRipadoPerfilProducts(), []);
-  const liveRipadoColaProducts = useMemo(() => getLiveRipadoColaProducts(), []);
-  const liveMantaProducts = useMemo(() => getLiveMantaProducts(), []);
-  const liveAutonivelanteCatalog = useMemo(() => getLiveAutonivelanteProducts(), []);
+  const [catalogVersion, setCatalogVersion] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    loadRendimentosFromSupabase()
+      .then(() => {
+        if (active) setCatalogVersion((v) => v + 1);
+      })
+      .catch(() => {});
+
+    const bumpCatalogVersion = () => setCatalogVersion((v) => v + 1);
+    window.addEventListener('fenix_rendimentos_updated', bumpCatalogVersion);
+    window.addEventListener('fenix_products_updated', bumpCatalogVersion);
+    window.addEventListener('storage', bumpCatalogVersion);
+    return () => {
+      active = false;
+      window.removeEventListener('fenix_rendimentos_updated', bumpCatalogVersion);
+      window.removeEventListener('fenix_products_updated', bumpCatalogVersion);
+      window.removeEventListener('storage', bumpCatalogVersion);
+    };
+  }, []);
+
+  const livePisoProducts = useMemo(() => getLivePisoProducts(), [catalogVersion]);
+  const liveRodapeProducts = useMemo(() => getLiveRodapeProducts(), [catalogVersion]);
+  const liveTetoProducts = useMemo(() => getLiveTetoProducts(), [catalogVersion]);
+  const liveTetoPerfilProducts = useMemo(() => getLiveTetoPerfilProducts(), [catalogVersion]);
+  const liveRipadoProducts = useMemo(() => getLiveRipadoProducts(), [catalogVersion]);
+  const liveRipadoPerfilProducts = useMemo(() => getLiveRipadoPerfilProducts(), [catalogVersion]);
+  const liveRipadoColaProducts = useMemo(() => getLiveRipadoColaProducts(), [catalogVersion]);
+  const liveMantaProducts = useMemo(() => getLiveMantaProducts(), [catalogVersion]);
+  const liveAutonivelanteCatalog = useMemo(() => getLiveAutonivelanteProducts(), [catalogVersion]);
 
   // =========================================================
   // 1. PISO VINÍLICO INPUTS (inicialmente sem informação)
@@ -610,7 +633,7 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
   // =========================================================
   // EXECUTE CALCULATION & SYNC UNIFIED TABLE
   // =========================================================
-  const executeCalculation = (keepCustom: boolean = false) => {
+  const buildCalculatorCategoryStates = () => {
     const pisoState: PisoState = {
       enabled: catPiso,
       selectedProduct: pisoProduct,
@@ -658,6 +681,13 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
       metroLinear: parseBRLNumber(mantaMlInput),
     };
 
+    return { pisoState, rodapeState, tetoState, ripadoState, mantaState };
+  };
+
+  const executeCalculation = (keepCustom: boolean = false) => {
+    const { pisoState, rodapeState, tetoState, ripadoState, mantaState } =
+      buildCalculatorCategoryStates();
+
     const rows = generateAllMaterialRows(
       pisoState,
       rodapeState,
@@ -670,10 +700,11 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
     setMaterials(rows);
   };
 
-  // Re-run whenever category states or inputs change, keeping custom values
+  // Re-run whenever category states, inputs, rendimentos or catalog change, keeping custom values
   useEffect(() => {
     executeCalculation(true);
   }, [
+    catalogVersion,
     catPiso,
     pisoProduct,
     pisoManual,
@@ -716,8 +747,18 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
   };
 
   const handleRowProductChange = (id: string, newProduct: string) => {
-    setMaterials((prev) =>
-      prev.map((row) => {
+    const { pisoState, rodapeState, tetoState, ripadoState, mantaState } =
+      buildCalculatorCategoryStates();
+
+    setMaterials((prev) => {
+      const targetRow = prev.find((r) => r.id === id);
+      const isFloorOrMantaCola =
+        targetRow &&
+        targetRow.typeKey.includes('cola') &&
+        !targetRow.typeKey.includes('rodape') &&
+        !targetRow.typeKey.includes('ripado');
+
+      const updatedRows = prev.map((row) => {
         if (row.id !== id) return row;
         if (row.typeKey.includes('autonivelante') && !row.isCustomQuantity) {
           const area = row.typeKey.includes('manta')
@@ -736,8 +777,21 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
           };
         }
         return { ...row, selectedProduct: newProduct };
-      })
-    );
+      });
+
+      if (isFloorOrMantaCola) {
+        return generateAllMaterialRows(
+          pisoState,
+          rodapeState,
+          tetoState,
+          ripadoState,
+          mantaState,
+          updatedRows
+        );
+      }
+
+      return updatedRows;
+    });
   };
 
   const handleQuantityStep = (id: string, delta: number) => {

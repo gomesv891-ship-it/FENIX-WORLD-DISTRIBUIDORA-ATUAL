@@ -23,6 +23,7 @@ export interface OrcamentoMessageData {
   descontoTexto?: string;
   numeroOrcamento?: string;
   categoria?: string;
+  exibirQuantidade?: boolean;
 }
 
 export const STORAGE_ORCAMENTO_MSG_KEY = 'fenix_config_mensagem_orcamento';
@@ -252,6 +253,9 @@ export function formatOrcamentoMessage(
           style: 'currency',
           currency: 'BRL',
         });
+        if (data.exibirQuantidade === false) {
+          return `• ${desc} (${itemTotal})`;
+        }
         return `• ${qtd} ${un} - ${desc} (${itemTotal})`;
       })
       .join('\n');

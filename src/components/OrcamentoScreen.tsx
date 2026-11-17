@@ -396,6 +396,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         setHasDescontoEnabled(false);
         setHasFreteEnabled(false);
         setFreteValorInput('0,00');
+        setExibirQuantidade(true);
+        persistedOrcIdRef.current = null;
         try {
           localStorage.removeItem(ACTIVE_DRAFT_KEY);
           localStorage.removeItem('fenix_orcamento_in_progress_draft');
@@ -448,6 +450,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         setHasDescontoEnabled(false);
         setHasFreteEnabled(false);
         setFreteValorInput('0,00');
+        setExibirQuantidade(true);
+        persistedOrcIdRef.current = null;
         try {
           localStorage.removeItem(ACTIVE_DRAFT_KEY);
           localStorage.removeItem('fenix_orcamento_in_progress_draft');
@@ -501,6 +505,15 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   });
   const [nomeOrcamento, setNomeOrcamento] = useState<string>(() => {
     return initialOrcamento?.nomeOrcamento || initialDraft?.nomeOrcamento || '';
+  });
+  const [exibirQuantidade, setExibirQuantidade] = useState<boolean>(() => {
+    if (initialOrcamento) {
+      return initialOrcamento.exibirQuantidade !== false;
+    }
+    if (typeof initialDraft?.exibirQuantidade === 'boolean') {
+      return initialDraft.exibirQuantidade;
+    }
+    return true;
   });
 
   // Estado para edição de item já adicionado
@@ -2998,6 +3011,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         )
       );
       setAreaTerreaSqm(initialOrcamento.areaTerreaSqm || '');
+      setExibirQuantidade(initialOrcamento.exibirQuantidade !== false);
     }
   }, [initialOrcamento]);
 
@@ -3027,6 +3041,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     descontoInput,
     descontoTexto,
     hasDescontoEnabled,
+    exibirQuantidade,
   });
 
   draftStateRef.current = {
@@ -3054,6 +3069,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     descontoInput,
     descontoTexto,
     hasDescontoEnabled,
+    exibirQuantidade,
   };
 
   // Salvar rascunho em andamento automaticamente a cada alteração (sem criar no Supabase ou duplicar)
@@ -3068,7 +3084,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       Boolean(observacoes && observacoes.trim()) ||
       Boolean(selectedClientId) ||
       hasFreteEnabled ||
-      hasDescontoEnabled;
+      hasDescontoEnabled ||
+      !exibirQuantidade;
 
     if (!hasData) {
       return;
@@ -3100,6 +3117,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         descontoInput,
         descontoTexto,
         hasDescontoEnabled,
+        exibirQuantidade,
         pisoLinks: Object.fromEntries(pisoInsumoLinksRef.current.entries()),
         rodapeLinks: Object.fromEntries(rodapeInsumoLinksRef.current.entries()),
         lockedPisoGroups: Array.from(lockedPisoInsumoGroupsRef.current),
@@ -3140,6 +3158,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     descontoInput,
     descontoTexto,
     hasDescontoEnabled,
+    exibirQuantidade,
   ]);
 
   // Garantir persistência ao desmontar (ex: usuário clica em Pós-Vendas, Clientes ou outra aba)
@@ -3153,7 +3172,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         Boolean(cur.observacoes && cur.observacoes.trim()) ||
         Boolean(cur.selectedClientId) ||
         cur.hasFreteEnabled ||
-        cur.hasDescontoEnabled;
+        cur.hasDescontoEnabled ||
+        !cur.exibirQuantidade;
 
       if (hasData) {
         try {
@@ -3180,7 +3200,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         Boolean(cur.nomeOrcamento && cur.nomeOrcamento.trim()) ||
         Boolean(cur.observacoes && cur.observacoes.trim()) ||
         Boolean(cur.selectedClientId) ||
-        cur.hasFreteEnabled;
+        cur.hasFreteEnabled ||
+        cur.hasDescontoEnabled ||
+        !cur.exibirQuantidade;
 
       if (hasData) {
         try {
@@ -3274,6 +3296,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       setDescontoInput('0,00');
       setDescontoTexto('DESCONTO PARA PAGAMENTO VIA PIX');
       setHasDescontoEnabled(false);
+      setExibirQuantidade(true);
+      persistedOrcIdRef.current = null;
       showToast('Rascunho descartado. Orçamento limpo para novo preenchimento.');
     }
   };
@@ -3317,6 +3341,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   useEffect(() => {
     if (initialOrcamento?.id) {
       persistedOrcIdRef.current = initialOrcamento.id;
+    } else {
+      persistedOrcIdRef.current = null;
     }
   }, [initialOrcamento]);
 
@@ -3378,6 +3404,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       descontoValor,
       descontoTexto: hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined,
       totalFinal,
+      exibirQuantidade,
       status: initialOrcamento?.status || 'Orçamento Enviado',
       savedAt: initialOrcamento?.savedAt || now.toISOString(),
       updatedAt: now.toISOString(),
@@ -3716,6 +3743,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       descontoValor: hasDescontoEnabled ? descontoValor : 0,
       descontoTexto: hasDescontoEnabled ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined,
       numeroOrcamento: nomeOrcamento || '',
+      exibirQuantidade,
     });
 
     const encoded = encodeURIComponent(message);
@@ -5762,9 +5790,66 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
               </p>
             </div>
           </div>
-          <span className="hidden sm:inline-flex px-3 py-1 rounded-full bg-blue-50 text-[#0057ff] text-xs font-bold border border-blue-200/60">
-            Visualização em Tempo Real
-          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={exibirQuantidade}
+            onClick={() => {
+              const nextVal = !exibirQuantidade;
+              setExibirQuantidade(nextVal);
+              const existingId = initialOrcamento?.id || persistedOrcIdRef.current;
+              if (existingId) {
+                try {
+                  const nowIso = new Date().toISOString();
+                  const historyList = getLocalCollectionSafe<SavedOrcamento>('fenix_orcamentos_history', []);
+                  let updatedRecord: SavedOrcamento | null = null;
+                  if (historyList.some((o) => o.id === existingId)) {
+                    const nextHist = historyList.map((o) => {
+                      if (o.id === existingId) {
+                        updatedRecord = { ...o, exibirQuantidade: nextVal, updatedAt: nowIso };
+                        return updatedRecord;
+                      }
+                      return o;
+                    });
+                    setLocalCollectionSafe('fenix_orcamentos_history', nextHist);
+                  }
+                  const savedList = getLocalCollectionSafe<SavedOrcamento>('fenix_saved_orcamentos', []);
+                  if (savedList.some((o) => o.id === existingId)) {
+                    const nextSaved = savedList.map((o) => {
+                      if (o.id === existingId) {
+                        const rec = { ...o, exibirQuantidade: nextVal, updatedAt: nowIso };
+                        if (!updatedRecord) updatedRecord = rec;
+                        return rec;
+                      }
+                      return o;
+                    });
+                    setLocalCollectionSafe('fenix_saved_orcamentos', nextSaved);
+                  }
+                  if (updatedRecord) {
+                    window.dispatchEvent(new Event('fenix_orcamentos_updated'));
+                    saveItemToSupabase('fenix_orcamentos_history', updatedRecord, 'id', currentUserName || consultoraName).catch(() => {});
+                    saveItemToSupabase('fenix_saved_orcamentos', updatedRecord, 'id', currentUserName || consultoraName).catch(() => {});
+                  }
+                } catch {}
+              }
+            }}
+            className="inline-flex items-center gap-2.5 cursor-pointer select-none focus:outline-none"
+          >
+            <span className="text-xs sm:text-sm font-semibold text-slate-700">
+              Exibir quantidade
+            </span>
+            <span
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ${
+                exibirQuantidade ? 'bg-[#0057ff]' : 'bg-slate-300'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-xs transition-transform duration-200 ${
+                  exibirQuantidade ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </span>
+          </button>
         </div>
 
         {/* The Exact Visual Mirror Component - Strict Landscape Format Preserved */}
@@ -5793,6 +5878,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
               descontoValor={hasDescontoEnabled && descontoValor > 0 ? descontoValor : undefined}
               descontoTexto={hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined}
               totalFinal={totalFinal}
+              exibirQuantidade={exibirQuantidade}
             />
           </div>
         </div>
